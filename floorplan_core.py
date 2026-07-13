@@ -17,9 +17,6 @@ from shapely.ops import unary_union
 
 import ifc_to_excel as ite  # 내외벽 판정(_determine_wall_classification), 면적계산(_area_columns) 등 재사용
 
-_SETTINGS = geom.settings()
-_SETTINGS.set('use-world-coords', True)
-
 # 평면도에 그릴 대상 클래스. Space는 클릭 가능(색상 채움), 나머지는 참고용 윤곽선만 표시.
 PLAN_STRUCTURAL_CLASSES = (
     'IfcWall', 'IfcWallStandardCase', 'IfcColumn', 'IfcBeam',
@@ -193,31 +190,45 @@ def match_spaces(spaces_a, spaces_b, area_thresh=2.0, centroid_thresh=1.0):
 def get_footprint_polygon(ent, tol=0.05):
     """엔티티의 바닥면(최저 Z 근처) 삼각형들을 shapely로 합쳐 실제 footprint 폴리곤 반환.
     형상이 없거나 계산 실패시 None. tol: 바닥면으로 간주할 Z 허용오차(m)."""
+    # [수정] 스레드 안전성(Thread-safety) 보장을 위해 지역 변수로 설정 생성
+    settings = geom.settings()
+    settings.set('use-world-coords', True)
+    
     try:
-        shape = geom.create_shape(_SETTINGS, ent)
+        shape = geom.create_shape(settings, ent)
     except Exception:
         return None
+        
     verts = np.array(shape.geometry.verts).reshape(-1, 3)
     faces = np.array(shape.geometry.faces).reshape(-1, 3)
     if len(verts) == 0 or len(faces) == 0:
         return None
+        
     zmin = verts[:, 2].min()
     polys = []
+    
     for tri in faces:
         p = verts[tri]
         if np.all(p[:, 2] <= zmin + tol):
             try:
                 poly = Polygon(p[:, :2])
+                # [수정] Shapely의 TopologicalError(꼬인 다각형 등) 방지
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                
                 if poly.is_valid and poly.area > 1e-9:
                     polys.append(poly)
             except Exception:
                 continue
+                
     if not polys:
         return None
+        
     try:
         u = unary_union(polys)
     except Exception:
         return None
+        
     if u.is_empty:
         return None
     return u
@@ -252,7 +263,12 @@ def _polygon_xy_lists(poly):
 
     geoms = poly.geoms if poly.geom_type == 'MultiPolygon' else [poly]
     for g in geoms:
-        _add_ring(list(g.exterior.coords))
+        # [수정] 외곽선뿐만 아니라 폴리곤 내부의 개구부/구멍(interiors)도 추출
+        if g.exterior:
+            _add_ring(list(g.exterior.coords))
+        for interior in g.interiors:
+            _add_ring(list(interior.coords))
+            
     return xs, ys
 
 
@@ -434,18 +450,6 @@ def _build_highlight_map(related, equipment, wall_classification):
         hl[e.GlobalId] = 'equipment'
     return hl
 
-    return {
-        'name': space_entity.Name or '(이름없음)',
-        'long_name': space_entity.LongName,
-        'guid': space_entity.GlobalId,
-        'area': round(space_area, 2) if space_area is not None else None,
-        'area_method': space_area_method,
-        'class_counts': dict(class_counts),
-        'wall_class_counts': dict(wall_class_counts),
-        'wall_area_by_class': {k: round(v, 2) for k, v in wall_area_by_class.items()},
-        'area_by_class': area_by_class,
-    }
-
 
 # ===================================================================
 # 5. Plotly 평면도 figure 생성
@@ -574,4 +578,3 @@ def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None,
         clickmode='event+select',
     )
     return fig
-
