@@ -104,6 +104,89 @@ def match_storeys(storeys_a, storeys_b, gap_cost=1000.0):
 
 
 # ===================================================================
+# 1b. 공간(Space) 자동 매핑 (면적 + centroid 좌표 오차 기준)
+# ===================================================================
+# 주의(실측으로 확인한 사실): 서로 다른 저작자가 만든 두 IFC는 좌표계 원점이 다를 수 있어
+# (실제로 샘플 파일 쌍에서 그랬음) centroid 좌표를 그냥 비교하면 항상 실패한다.
+# 반면 면적은 저작자와 무관하게 거의 그대로 보존되므로, 면적이 비슷한 후보쌍들에서
+# "좌표계 평행이동 오프셋"을 먼저 통계적으로 추정한 뒤 그 오프셋을 보정해 centroid 거리를
+# 비교한다. 회전 차이는 다루지 않는다(검증한 샘플은 회전 없이 평행이동만 달랐음 - 다른
+# 모델 쌍은 회전까지 다를 경우 이 방식이 통하지 않을 수 있음).
+
+def _offset_candidates(spaces_a, spaces_b, area_thresh):
+    """면적차가 area_thresh 이내인 모든 (A,B) 후보쌍의 offset(=centroid_B - centroid_A) 벡터."""
+    candidates = []
+    for a in spaces_a:
+        ca = a['polygon'].centroid
+        aa = a['polygon'].area
+        for b in spaces_b:
+            ab = b['polygon'].area
+            if abs(aa - ab) <= area_thresh:
+                cb = b['polygon'].centroid
+                candidates.append((cb.x - ca.x, cb.y - ca.y))
+    return candidates
+
+
+def _estimate_offset(candidates, cluster_tol=0.5):
+    """후보 offset들 중 가장 밀집된 클러스터의 평균을 좌표계 오프셋으로 추정.
+    (정답 매칭들은 전부 같은 오프셋에 모이고, 우연히 면적만 비슷한 오탐은 흩어지므로
+    가장 큰 클러스터가 진짜 오프셋일 가능성이 높다)"""
+    if not candidates:
+        return None
+    arr = np.array(candidates)
+    best_center, best_count = None, 0
+    for c in arr:
+        dist = np.linalg.norm(arr - c, axis=1)
+        inliers = arr[dist <= cluster_tol]
+        if len(inliers) > best_count:
+            best_count = len(inliers)
+            best_center = inliers.mean(axis=0)
+    return (float(best_center[0]), float(best_center[1])) if best_center is not None else None
+
+
+def match_spaces(spaces_a, spaces_b, area_thresh=2.0, centroid_thresh=1.0):
+    """면적(㎡) 오차와 좌표계 오프셋 보정 후 centroid 거리(m) 오차가 각각 임계값 이내인
+    공간을 1:1 그리디 매칭(가까운 거리 우선).
+    반환: (a_to_b, b_to_a, offset, match_info)
+      - a_to_b/b_to_a: {GlobalId: GlobalId} 매핑 dict
+      - offset: 추정된 좌표계 평행이동 (dx, dy) 또는 매칭 후보가 없으면 None
+      - match_info: 매칭된 쌍의 상세 리스트(diagnostic/표시용)
+    """
+    candidates = _offset_candidates(spaces_a, spaces_b, area_thresh)
+    offset = _estimate_offset(candidates)
+    if offset is None:
+        return {}, {}, None, []
+    dx, dy = offset
+
+    pairs = []
+    for a in spaces_a:
+        ca = a['polygon'].centroid
+        aa = a['polygon'].area
+        for b in spaces_b:
+            cb = b['polygon'].centroid
+            ab = b['polygon'].area
+            area_diff = abs(aa - ab)
+            if area_diff > area_thresh:
+                continue
+            dist = ((ca.x + dx - cb.x) ** 2 + (ca.y + dy - cb.y) ** 2) ** 0.5
+            if dist <= centroid_thresh:
+                pairs.append((dist, a['guid'], b['guid'], area_diff))
+
+    pairs.sort(key=lambda p: p[0])
+    used_a, used_b = set(), set()
+    a_to_b, b_to_a, match_info = {}, {}, []
+    for dist, ga, gb, adiff in pairs:
+        if ga in used_a or gb in used_b:
+            continue
+        used_a.add(ga); used_b.add(gb)
+        a_to_b[ga] = gb
+        b_to_a[gb] = ga
+        match_info.append({'a_guid': ga, 'b_guid': gb, 'centroid_dist_m': round(dist, 3), 'area_diff_m2': round(adiff, 3)})
+
+    return a_to_b, b_to_a, offset, match_info
+
+
+# ===================================================================
 # 2. 지오메트리 (실제 footprint 폴리곤 추출)
 # ===================================================================
 
