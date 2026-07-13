@@ -223,8 +223,11 @@ def build_storey_plan_data(storey_entity, tol=0.05):
 # 4. 클릭된 Space의 상세 정보
 # ===================================================================
 
+EQUIPMENT_CLASSES = ('IfcLightFixture', 'IfcSensor', 'IfcFireSuppressionTerminal', 'IfcAlarm')
+
+
 def get_space_related_elements(ifc_file, space_entity):
-    """해당 Space와 RelSpaceBoundary로 연결된 부재 목록."""
+    """해당 Space와 RelSpaceBoundary로 연결된 부재 목록 (벽/기둥/문/창/바닥 등 경계형성 요소)."""
     related = []
     for rel in ifc_file.by_type('IfcRelSpaceBoundary'):
         if rel.RelatingSpace == space_entity and rel.RelatedBuildingElement is not None:
@@ -232,38 +235,79 @@ def get_space_related_elements(ifc_file, space_entity):
     return related
 
 
+def get_space_contained_equipment(ifc_file, space_entity, classes=EQUIPMENT_CLASSES):
+    """해당 Space '안에' 배치된 설비(조명/센서/소방장치 등) 목록.
+    이런 설비는 RelSpaceBoundary(경계형성)가 아니라 IfcRelContainedInSpatialStructure
+    (공간적 포함관계)로 Space와 연결된다 (실측으로 확인한 IFC 구조)."""
+    equipment = []
+    for rel in ifc_file.by_type('IfcRelContainedInSpatialStructure'):
+        if rel.RelatingStructure == space_entity:
+            for el in rel.RelatedElements:
+                if el.is_a() in classes:
+                    equipment.append(el)
+    return equipment
+
+
+def _wall_display_category(result):
+    """내/외벽 판정을 좌/우(전문가·AI) 비교가 대칭이 되도록 '내부'/'외부' 이진으로 단순화.
+    '판정불가'는 근거 데이터가 없을 뿐 외벽일 가능성을 배제할 수 없고, 무엇보다
+    AI 모델처럼 한쪽이 전부 판정불가로 나오는 경우 비교 자체가 안 되므로,
+    사용자 요청에 따라 '외부'로 편입하되 괄호로 표시해 원래 판정불가였음을 남긴다."""
+    if result == '내벽':
+        return '내부', '내벽'
+    if result == '판정불가':
+        return '외부', '외벽(판정불가)'
+    return '외부', result  # '외벽' / '외벽(추정)'
+
+
 def build_space_detail(ifc_file, wall_classification, space_entity):
-    """클릭된 Space 1개에 대한 요약 정보(구조재 개수 - 내/외벽 구분 포함, 유형별 면적)."""
+    """클릭된 Space 1개에 대한 요약 정보:
+    - 접한 구조재 개수(전체) + 벽 내/외부 구분(좌우대칭 이진 + 상세근거 병기)
+    - 관련된 모든 부재 유형별 합산 면적(계산 가능한 모든 클래스, 벽은 별도 처리)
+    - 공간 내 설비(조명/센서/소방장치/경보기) 개수
+    """
     related = get_space_related_elements(ifc_file, space_entity)
+    equipment = get_space_contained_equipment(ifc_file, space_entity)
 
     class_counts = Counter(e.is_a() for e in related)
 
-    wall_class_counts = Counter()
-    wall_area_by_class = Counter()
+    # 벽 내/외부 구분 (좌우 대칭 이진) + 상세 판정(원래 4분류) 병기
+    wall_simple_counts = Counter()
+    wall_simple_area = Counter()
+    wall_detail_counts = Counter()
     for e in related:
         if not e.is_a('IfcWall'):
             continue
         result, _reason = wall_classification.get(e.GlobalId, ('판정불가', ''))
-        wall_class_counts[result] += 1
+        simple, detail_label = _wall_display_category(result)
+        wall_simple_counts[simple] += 1
+        wall_detail_counts[detail_label] += 1
         flat = ite._flatten_psets(e)
         v = flat.get('Qto_WallBaseQuantities.Gross_Side_Area')
         if isinstance(v, (int, float)):
-            wall_area_by_class[result] += v
+            wall_simple_area[simple] += v
 
+    # 벽 이외 관련 부재: 계산 가능한 모든 클래스에 대해 면적 산정 시도 ("가능한 경우"만 채워짐)
     area_by_class = {}
-    for cls in ('IfcSlab', 'IfcCovering', 'IfcRoof'):
+    non_wall_classes = sorted(set(e.is_a() for e in related if not e.is_a('IfcWall')))
+    for cls in non_wall_classes:
         ents = [e for e in related if e.is_a(cls)]
-        if not ents:
-            continue
-        total = 0.0
+        total, n_ok = 0.0, 0
         for e in ents:
             flat = ite._flatten_psets(e)
             cols = ite._area_columns(e, flat)
             if cols['면적(㎡)'] is not None:
                 total += cols['면적(㎡)']
-        area_by_class[cls] = round(total, 2)
+                n_ok += 1
+        area_by_class[cls] = {
+            '면적합계(㎡)': round(total, 2) if n_ok else None,
+            '산출가능/전체': f'{n_ok}/{len(ents)}',
+        }
 
-    # Space 자신의 면적 (Qto 있으면 우선, 없으면 좌표 기반 폴백)
+    # 설비 개수 (구조재와 별도 집계)
+    equipment_counts = Counter(e.is_a() for e in equipment)
+
+    # Space 자신의 면적
     flat_sp = ite._flatten_psets(space_entity)
     space_area, space_area_method = None, None
     for key in ('Qto_SpaceBaseQuantities.NetFloorArea', 'Qto_SpaceBaseQuantities.GrossFloorArea'):
@@ -273,6 +317,39 @@ def build_space_detail(ifc_file, wall_classification, space_entity):
     if space_area is None:
         cols = ite._area_columns(space_entity, flat_sp)
         space_area, space_area_method = cols['면적(㎡)'], cols['면적산출방식']
+
+    return {
+        'name': space_entity.Name or '(이름없음)',
+        'long_name': space_entity.LongName,
+        'guid': space_entity.GlobalId,
+        'area': round(space_area, 2) if space_area is not None else None,
+        'area_method': space_area_method,
+        'class_counts': dict(class_counts),
+        'wall_simple_counts': dict(wall_simple_counts),
+        'wall_simple_area': {k: round(v, 2) for k, v in wall_simple_area.items()},
+        'wall_detail_counts': dict(wall_detail_counts),
+        'area_by_class': area_by_class,
+        'equipment_counts': dict(equipment_counts),
+        # 평면도 하이라이트용: 각 관련 부재 GlobalId -> 표시 카테고리
+        'highlight_map': _build_highlight_map(related, equipment, wall_classification),
+    }
+
+
+def _build_highlight_map(related, equipment, wall_classification):
+    """평면도에서 색을 다르게 칠하기 위한 GlobalId -> 카테고리 매핑.
+    카테고리: 'wall_internal'(내벽) / 'wall_external'(외벽, 판정불가 포함) /
+              'related'(벽 이외 경계 관련 부재) / 'equipment'(조명/센서/소방설비)."""
+    hl = {}
+    for e in related:
+        if e.is_a('IfcWall'):
+            result, _ = wall_classification.get(e.GlobalId, ('판정불가', ''))
+            simple, _ = _wall_display_category(result)
+            hl[e.GlobalId] = 'wall_internal' if simple == '내부' else 'wall_external'
+        else:
+            hl[e.GlobalId] = 'related'
+    for e in equipment:
+        hl[e.GlobalId] = 'equipment'
+    return hl
 
     return {
         'name': space_entity.Name or '(이름없음)',
@@ -301,27 +378,58 @@ _STRUCT_COLORS = {
     'IfcDoor': 'rgba(150,100,50,0.6)',
     'IfcWindow': 'rgba(120,200,230,0.6)',
 }
+_FADED_COLOR = 'rgba(210,210,210,0.35)'
+_FADED_LINE = 'rgba(190,190,190,0.5)'
+
+# 공간 클릭시 하이라이트 색상 (카테고리별로 뚜렷이 구분)
+_HIGHLIGHT_COLORS = {
+    'wall_internal': ('rgba(30,110,230,0.85)', 'rgba(15,70,160,1.0)'),   # 내벽 = 파랑
+    'wall_external': ('rgba(230,90,30,0.85)', 'rgba(170,60,10,1.0)'),    # 외벽(판정불가 포함) = 주황
+    'related': ('rgba(160,50,190,0.75)', 'rgba(110,20,140,1.0)'),        # 벽 이외 관련부재 = 보라
+}
+_EQUIPMENT_COLOR = 'rgba(220,190,20,0.95)'  # 설비(조명/센서/소방) = 노랑 마커
+
 _SPACE_FILL = 'rgba(100,180,120,0.35)'
 _SPACE_FILL_SELECTED = 'rgba(230,100,60,0.55)'
 _SPACE_LINE = 'rgba(60,140,80,0.9)'
 _SPACE_LINE_SELECTED = 'rgba(200,60,20,1.0)'
 
 
-def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None):
+def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None,
+                       highlight_map=None, equipment_entities=None):
     """plan_data(build_storey_plan_data 반환값)로 Plotly Figure 생성.
+
     Space는 내부에 보이지 않는 마커 격자를 깔아 '폴리곤 내부 아무 곳이나 클릭'해도
     선택되도록 한다(Plotly는 기본적으로 마커/점 단위로만 클릭을 인식하기 때문).
-    selected_guid가 주어지면 해당 Space를 강조색으로 그린다."""
+
+    selected_guid: 강조 표시할 선택된 Space의 GlobalId.
+    highlight_map: build_space_detail()이 반환한 {GlobalId: 카테고리} 딕셔너리.
+        선택된 Space와 관련된 구조요소를 카테고리별 색상으로 강조하고, 나머지 배경
+        구조요소는 흐리게(faded) 처리해 '내부 객체(파랑)/외부 객체(주황)/기타 관련부재(보라)'가
+        한눈에 구분되도록 한다. None이면(선택 없음) 기본 클래스별 색상으로 표시.
+    equipment_entities: 선택된 Space '안에' 있는 설비(조명/센서/소방장치 등) ifcopenshell 엔티티
+        목록. 평면도에 노란 마커로 추가 표시한다 (RelSpaceBoundary 대상이 아니라 별도로 그림).
+    """
     import plotly.graph_objects as go
     fig = go.Figure()
+    highlight_map = highlight_map or {}
 
-    # 구조요소(벽/기둥/보/바닥 등): 참고용 배경, 클릭 대상 아님
+    # 구조요소(벽/기둥/보/바닥 등)
     for el in plan_data['structural']:
         xs, ys = _polygon_xy_lists(el['polygon'])
-        color = _STRUCT_COLORS.get(el['class'], 'rgba(150,150,150,0.5)')
+        cat = highlight_map.get(el['guid'])
+        if highlight_map:
+            if cat in _HIGHLIGHT_COLORS:
+                fill_c, line_c = _HIGHLIGHT_COLORS[cat]
+                line_w = 1.5
+            else:
+                fill_c, line_c, line_w = _FADED_COLOR, _FADED_LINE, 0.5
+        else:
+            fill_c = _STRUCT_COLORS.get(el['class'], 'rgba(150,150,150,0.5)')
+            line_c, line_w = 'rgba(60,60,60,0.6)', 0.5
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode='lines', fill='toself',
-            line=dict(width=0.5, color='rgba(60,60,60,0.6)'), fillcolor=color,
+            line=dict(width=line_w, color=line_c), fillcolor=fill_c,
             hoverinfo='text', text=f"{el['class']} {el['name']}".strip(),
             showlegend=False,
         ))
@@ -348,6 +456,31 @@ def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None):
             hovertemplate=f"{sp['name']}<br>면적 약 {round(sp['polygon'].area,1)}㎡<extra></extra>",
             showlegend=False,
         ))
+
+    # 설비(조명/센서/소방장치): 선택된 Space 안에 있는 것만 노란 마커로 표시
+    if equipment_entities:
+        ex, ey, etext = [], [], []
+        for e in equipment_entities:
+            poly = get_footprint_polygon(e)
+            if poly is not None and not poly.is_empty:
+                c = poly.centroid
+                ex.append(c.x); ey.append(c.y)
+            else:
+                # 형상이 없으면 배치 좌표(ObjectPlacement)라도 사용
+                try:
+                    import ifcopenshell.util.placement as plc
+                    m = plc.get_local_placement(e.ObjectPlacement)
+                    ex.append(float(m[0, 3])); ey.append(float(m[1, 3]))
+                except Exception:
+                    continue
+            etext.append(f"{e.is_a()} {e.Name or ''}".strip())
+        if ex:
+            fig.add_trace(go.Scatter(
+                x=ex, y=ey, mode='markers',
+                marker=dict(size=11, color=_EQUIPMENT_COLOR, symbol='diamond',
+                            line=dict(width=1, color='rgba(120,100,0,1)')),
+                text=etext, hoverinfo='text', showlegend=False,
+            ))
 
     fig.update_xaxes(showgrid=False, zeroline=False, visible=False)
     fig.update_yaxes(showgrid=False, zeroline=False, visible=False, scaleanchor='x', scaleratio=1)
