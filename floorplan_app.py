@@ -123,7 +123,7 @@ def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix):
     )
     event = st.plotly_chart(
         fig, key=f'{session_prefix}_plot', on_select='rerun',
-        selection_mode=('points',), use_container_width=True,
+        selection_mode=('points',), width='stretch',
     )
 
     new_guid = None
