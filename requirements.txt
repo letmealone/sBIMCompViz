@@ -1,0 +1,7 @@
+streamlit>=1.35
+plotly
+shapely
+ifcopenshell
+numpy
+pandas
+openpyxl
