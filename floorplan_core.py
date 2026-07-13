@@ -144,46 +144,103 @@ def _estimate_offset(candidates, cluster_tol=0.5):
     return (float(best_center[0]), float(best_center[1])) if best_center is not None else None
 
 
-def match_spaces(spaces_a, spaces_b, area_thresh=2.0, centroid_thresh=1.0):
-    """면적(㎡) 오차와 좌표계 오프셋 보정 후 centroid 거리(m) 오차가 각각 임계값 이내인
-    공간을 1:1 그리디 매칭(가까운 거리 우선).
+def match_spaces(spaces_a, spaces_b, area_thresh=2.0, centroid_thresh=1.0,
+                  adjacency_tol=0.1, max_group=5):
+    """공간 자동 매핑 (조닝이 다를 수 있음을 감안한 고도화 버전).
+    각 방향(A->B, B->A)에 대해 find_matching_group()을 적용한다:
+      1) 오프셋 보정한 centroid 거리로 최근접 후보를 찾는다 (centroid_thresh 이내여야 시작 가능).
+      2) 그 후보의 면적이 바로 area_thresh 이내면 1:1로 확정.
+      3) 아니면 그 후보에 인접한(adjacency_tol 이내) 공간들을 면적차를 줄이는 방향으로
+         최대 max_group개까지 순차 병합하며 area_thresh 이내가 되는지 탐색한다
+         (한쪽 모델이 조닝을 여러 개로 쪼개거나 합친 경우 대응).
     반환: (a_to_b, b_to_a, offset, match_info)
-      - a_to_b/b_to_a: {GlobalId: GlobalId} 매핑 dict
-      - offset: 추정된 좌표계 평행이동 (dx, dy) 또는 매칭 후보가 없으면 None
-      - match_info: 매칭된 쌍의 상세 리스트(diagnostic/표시용)
+      - a_to_b/b_to_a: {GlobalId: [GlobalId, ...]} (1개 이상의 리스트 - 병합 매칭이면 여러 개)
+      - offset: 추정된 좌표계 평행이동 (dx, dy) 또는 후보가 없으면 None
+      - match_info: A->B 방향 매칭의 상세 리스트(diagnostic/표시용)
     """
     candidates = _offset_candidates(spaces_a, spaces_b, area_thresh)
     offset = _estimate_offset(candidates)
     if offset is None:
         return {}, {}, None, []
-    dx, dy = offset
 
-    pairs = []
+    a_to_b, match_info = {}, []
     for a in spaces_a:
-        ca = a['polygon'].centroid
-        aa = a['polygon'].area
-        for b in spaces_b:
-            cb = b['polygon'].centroid
-            ab = b['polygon'].area
-            area_diff = abs(aa - ab)
-            if area_diff > area_thresh:
-                continue
-            dist = ((ca.x + dx - cb.x) ** 2 + (ca.y + dy - cb.y) ** 2) ** 0.5
-            if dist <= centroid_thresh:
-                pairs.append((dist, a['guid'], b['guid'], area_diff))
+        m = find_matching_group(a, spaces_b, offset, area_thresh, centroid_thresh, adjacency_tol, max_group)
+        if m:
+            a_to_b[a['guid']] = m['guids']
+            match_info.append({
+                'a_guid': a['guid'], 'b_guids': m['guids'],
+                'centroid_dist_m': round(m['centroid_dist'], 3),
+                'area_diff_m2': round(abs(m['total_area'] - a['polygon'].area), 3),
+                'merged': m['merged'],
+            })
 
-    pairs.sort(key=lambda p: p[0])
-    used_a, used_b = set(), set()
-    a_to_b, b_to_a, match_info = {}, {}, []
-    for dist, ga, gb, adiff in pairs:
-        if ga in used_a or gb in used_b:
-            continue
-        used_a.add(ga); used_b.add(gb)
-        a_to_b[ga] = gb
-        b_to_a[gb] = ga
-        match_info.append({'a_guid': ga, 'b_guid': gb, 'centroid_dist_m': round(dist, 3), 'area_diff_m2': round(adiff, 3)})
+    neg_offset = (-offset[0], -offset[1])
+    b_to_a = {}
+    for b in spaces_b:
+        m = find_matching_group(b, spaces_a, neg_offset, area_thresh, centroid_thresh, adjacency_tol, max_group)
+        if m:
+            b_to_a[b['guid']] = m['guids']
 
     return a_to_b, b_to_a, offset, match_info
+
+
+def find_matching_group(seed_space, target_spaces, offset, area_thresh, centroid_thresh,
+                         adjacency_tol=0.1, max_group=5):
+    """seed_space 하나에 대응하는 target_spaces 내 공간(1개 이상)을 찾는다.
+    반환: {'guids': [...], 'total_area': float, 'centroid_dist': float, 'merged': bool} 또는 None.
+    (merged=True면 여러 공간을 병합해서 맞춘 경우 - 조닝 차이 대응)"""
+    if not target_spaces:
+        return None
+    dx, dy = offset
+    seed_c = seed_space['polygon'].centroid
+    scx, scy = seed_c.x + dx, seed_c.y + dy
+    seed_area = seed_space['polygon'].area
+
+    dists = []
+    for t in target_spaces:
+        tc = t['polygon'].centroid
+        d = ((scx - tc.x) ** 2 + (scy - tc.y) ** 2) ** 0.5
+        dists.append((d, t))
+    dists.sort(key=lambda x: x[0])
+    nearest_dist, seed_match = dists[0]
+    if nearest_dist > centroid_thresh:
+        return None  # 가장 가까운 후보조차 너무 멀면 이 방향 매칭 자체를 포기
+
+    total_area = seed_match['polygon'].area
+    if abs(total_area - seed_area) <= area_thresh:
+        return {'guids': [seed_match['guid']], 'total_area': total_area,
+                'centroid_dist': nearest_dist, 'merged': False}
+
+    # 면적이 안 맞으면: 최근접 후보에 인접한 공간들을 순차 병합해 목표 면적에 맞춰본다
+    used = {seed_match['guid']}
+    group = [seed_match]
+    merged_poly = seed_match['polygon']
+    pool = [t for t in target_spaces if t['guid'] != seed_match['guid']]
+
+    for _ in range(max_group - 1):
+        candidates = []
+        for t in pool:
+            if t['guid'] in used:
+                continue
+            if merged_poly.distance(t['polygon']) <= adjacency_tol:
+                candidates.append(t)
+        if not candidates:
+            break
+        best, best_diff = None, None
+        for cand in candidates:
+            diff = abs(total_area + cand['polygon'].area - seed_area)
+            if best_diff is None or diff < best_diff:
+                best_diff, best = diff, cand
+        group.append(best)
+        used.add(best['guid'])
+        total_area += best['polygon'].area
+        merged_poly = merged_poly.union(best['polygon'])
+        if abs(total_area - seed_area) <= area_thresh:
+            return {'guids': [g['guid'] for g in group], 'total_area': total_area,
+                    'centroid_dist': nearest_dist, 'merged': True}
+
+    return None  # 최대 병합 개수까지 시도해도 면적이 안 맞음
 
 
 # ===================================================================
@@ -331,6 +388,16 @@ def get_space_contained_equipment(ifc_file, space_entity, classes=EQUIPMENT_CLAS
     return equipment
 
 
+def get_group_contained_equipment(ifc_file, space_entities):
+    """여러 Space(조닝 병합 그룹)에 대해 get_space_contained_equipment()를 합치고
+    GlobalId 기준 중복 제거."""
+    by_guid = {}
+    for ent in space_entities:
+        for el in get_space_contained_equipment(ifc_file, ent):
+            by_guid[el.GlobalId] = el
+    return list(by_guid.values())
+
+
 def _wall_display_category(result):
     """내/외벽 판정을 좌/우(전문가·AI) 비교가 대칭이 되도록 '내부'/'외부' 이진으로 단순화.
     '판정불가'는 근거 데이터가 없을 뿐 외벽일 가능성을 배제할 수 없고, 무엇보다
@@ -434,16 +501,80 @@ def _build_highlight_map(related, equipment, wall_classification):
         hl[e.GlobalId] = 'equipment'
     return hl
 
+
+def build_space_group_detail(ifc_file, wall_classification, space_entries):
+    """여러 Space를 하나의 '조닝 그룹'으로 묶어 집계 (자동매핑이 여러 공간을 병합해
+    매칭한 경우 사용). space_entries: [{'guid','name','polygon','entity'}, ...] 1개 이상
+    (build_storey_plan_data()의 plan_data['spaces'] 원소 형식).
+    1개만 주어져도 정상 동작하며, build_space_detail()과 값 구조는 동일하되
+    'area'는 footprint 폴리곤 합산 기준(자동매핑에 쓰인 것과 동일 기준)이라
+    Qto 우선인 build_space_detail()의 area와 약간 다를 수 있다."""
+    entities = [e['entity'] for e in space_entries]
+
+    related_by_guid = {}
+    for ent in entities:
+        for el in get_space_related_elements(ifc_file, ent):
+            related_by_guid[el.GlobalId] = el
+    related = list(related_by_guid.values())
+
+    equipment = get_group_contained_equipment(ifc_file, entities)
+
+    class_counts = Counter(e.is_a() for e in related)
+
+    wall_simple_counts = Counter()
+    wall_simple_area = Counter()
+    wall_detail_counts = Counter()
+    for e in related:
+        if not e.is_a('IfcWall'):
+            continue
+        result, _reason = wall_classification.get(e.GlobalId, ('판정불가', ''))
+        simple, detail_label = _wall_display_category(result)
+        wall_simple_counts[simple] += 1
+        wall_detail_counts[detail_label] += 1
+        flat = ite._flatten_psets(e)
+        v = flat.get('Qto_WallBaseQuantities.Gross_Side_Area')
+        if isinstance(v, (int, float)):
+            wall_simple_area[simple] += v
+
+    area_by_class = {}
+    non_wall_classes = sorted(set(e.is_a() for e in related if not e.is_a('IfcWall')))
+    for cls in non_wall_classes:
+        ents = [e for e in related if e.is_a(cls)]
+        total, n_ok = 0.0, 0
+        for e in ents:
+            flat = ite._flatten_psets(e)
+            cols = ite._area_columns(e, flat)
+            if cols['면적(㎡)'] is not None:
+                total += cols['면적(㎡)']
+                n_ok += 1
+        area_by_class[cls] = {
+            '면적합계(㎡)': round(total, 2) if n_ok else None,
+            '산출가능/전체': f'{n_ok}/{len(ents)}',
+        }
+
+    equipment_counts = Counter(e.is_a() for e in equipment)
+
+    total_area = sum(e['polygon'].area for e in space_entries)
+    names = [e['name'] for e in space_entries]
+    guids = [e['guid'] for e in space_entries]
+    is_group = len(guids) > 1
+
     return {
-        'name': space_entity.Name or '(이름없음)',
-        'long_name': space_entity.LongName,
-        'guid': space_entity.GlobalId,
-        'area': round(space_area, 2) if space_area is not None else None,
-        'area_method': space_area_method,
+        'name': ' + '.join(names),
+        'long_name': None,
+        'guid': guids[0] if not is_group else None,
+        'guids': guids,
+        'is_group': is_group,
+        'area': round(total_area, 2),
+        'area_method': ('footprint 직접계산' if not is_group
+                         else f'footprint 합산 ({len(guids)}개 공간 조닝 병합)'),
         'class_counts': dict(class_counts),
-        'wall_class_counts': dict(wall_class_counts),
-        'wall_area_by_class': {k: round(v, 2) for k, v in wall_area_by_class.items()},
+        'wall_simple_counts': dict(wall_simple_counts),
+        'wall_simple_area': {k: round(v, 2) for k, v in wall_simple_area.items()},
+        'wall_detail_counts': dict(wall_detail_counts),
         'area_by_class': area_by_class,
+        'equipment_counts': dict(equipment_counts),
+        'highlight_map': _build_highlight_map(related, equipment, wall_classification),
     }
 
 
@@ -485,17 +616,26 @@ def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None,
     Space는 내부에 보이지 않는 마커 격자를 깔아 '폴리곤 내부 아무 곳이나 클릭'해도
     선택되도록 한다(Plotly는 기본적으로 마커/점 단위로만 클릭을 인식하기 때문).
 
-    selected_guid: 강조 표시할 선택된 Space의 GlobalId.
-    highlight_map: build_space_detail()이 반환한 {GlobalId: 카테고리} 딕셔너리.
-        선택된 Space와 관련된 구조요소를 카테고리별 색상으로 강조하고, 나머지 배경
-        구조요소는 흐리게(faded) 처리해 '내부 객체(파랑)/외부 객체(주황)/기타 관련부재(보라)'가
-        한눈에 구분되도록 한다. None이면(선택 없음) 기본 클래스별 색상으로 표시.
-    equipment_entities: 선택된 Space '안에' 있는 설비(조명/센서/소방장치 등) ifcopenshell 엔티티
-        목록. 평면도에 노란 마커로 추가 표시한다 (RelSpaceBoundary 대상이 아니라 별도로 그림).
+    selected_guid: 강조 표시할 선택된 Space의 GlobalId. 문자열(단일) 또는
+        리스트/집합(조닝 병합으로 여러 공간이 함께 선택된 경우) 모두 허용.
+    highlight_map: build_space_detail()/build_space_group_detail()이 반환한
+        {GlobalId: 카테고리} 딕셔너리. 선택된 Space(그룹)와 관련된 구조요소를 카테고리별
+        색상으로 강조하고, 나머지 배경 구조요소는 흐리게(faded) 처리해 '내부 객체(파랑)/
+        외부 객체(주황)/기타 관련부재(보라)'가 한눈에 구분되도록 한다.
+        None이면(선택 없음) 기본 클래스별 색상으로 표시.
+    equipment_entities: 선택된 Space(그룹) '안에' 있는 설비(조명/센서/소방장치 등)
+        ifcopenshell 엔티티 목록. 평면도에 노란 마커로 추가 표시한다.
     """
     import plotly.graph_objects as go
     fig = go.Figure()
     highlight_map = highlight_map or {}
+
+    if selected_guid is None:
+        selected_guids = set()
+    elif isinstance(selected_guid, (list, tuple, set)):
+        selected_guids = set(selected_guid)
+    else:
+        selected_guids = {selected_guid}
 
     # 구조요소(벽/기둥/보/바닥 등)
     for el in plan_data['structural']:
@@ -519,7 +659,7 @@ def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None,
 
     # Space: 시각적 채움(폴리곤) + 클릭 히트영역(격자 마커, 투명)
     for sp in plan_data['spaces']:
-        is_sel = (selected_guid is not None and sp['guid'] == selected_guid)
+        is_sel = sp['guid'] in selected_guids
         fill_c = _SPACE_FILL_SELECTED if is_sel else _SPACE_FILL
         line_c = _SPACE_LINE_SELECTED if is_sel else _SPACE_LINE
 

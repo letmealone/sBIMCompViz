@@ -7,7 +7,8 @@ floorplan_app.py
 핵심 기능:
 - 층별 평면도 좌/우 비교, 공간(Space) 클릭시 접한 구조재/내외벽/면적/설비 정보 표시
 - 공간 클릭시 내부(파랑)/외부(주황)/기타관련부재(보라)/설비(노랑) 색상 하이라이트
-- (선택) 공간 자동 매핑: 면적+centroid 좌표 오차 임계값 기준으로 한쪽 클릭시 반대편도 자동 선택
+- (선택) 공간 자동 매핑: 면적+centroid 좌표 오차 임계값 기준. 조닝이 달라 1:1로 안 맞으면
+  인접 공간을 순차 병합해 면적을 맞춰보는 고도화된 매칭까지 지원
 - 비교 테이블(구조재개수/내외부구분/유형별면적/설비개수)은 두 IFC의 합집합 키로 통일해 표시
 
 실행:
@@ -76,15 +77,25 @@ def _build_plan_cached(_storeys, storey_name, cache_tag):
     return fc.build_storey_plan_data(storey)
 
 
-@st.cache_resource(show_spinner='공간 자동 매핑 계산 중... (면적으로 좌표계 오프셋 추정 후 centroid 매칭)')
-def _match_spaces_cached(_spaces_a, _spaces_b, area_thresh, centroid_thresh, cache_tag):
+@st.cache_resource(show_spinner='공간 자동 매핑 계산 중... (면적으로 좌표계 오프셋 추정 후 매칭, 조닝 다르면 인접공간 병합 시도)')
+def _match_spaces_cached(_spaces_a, _spaces_b, area_thresh, centroid_thresh, adjacency_tol, max_group, cache_tag):
     """_spaces_a/_spaces_b: 언더스코어 접두사라 해싱 제외(폴리곤 객체 포함이라 해시 불가/불안정).
-    area_thresh, centroid_thresh, cache_tag는 해시 가능 -> 임계값/층조합이 바뀌면 캐시도 갱신됨."""
-    return fc.match_spaces(_spaces_a, _spaces_b, area_thresh=area_thresh, centroid_thresh=centroid_thresh)
+    나머지 인자는 해시 가능 -> 임계값/층조합이 바뀌면 캐시도 갱신됨."""
+    return fc.match_spaces(_spaces_a, _spaces_b, area_thresh=area_thresh, centroid_thresh=centroid_thresh,
+                            adjacency_tol=adjacency_tol, max_group=max_group)
+
+
+def _get_selected_entries(plan, selected_guids):
+    """plan['spaces']에서 선택된 guid(들)에 해당하는 항목들 반환."""
+    if not selected_guids:
+        return []
+    guid_set = set(selected_guids) if isinstance(selected_guids, (list, tuple, set)) else {selected_guids}
+    return [s for s in plan['spaces'] if s['guid'] in guid_set]
 
 
 def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix):
-    """평면도 렌더링 + 클릭 이벤트 처리. (선택된 공간의 detail, 새로 클릭된 guid) 반환."""
+    """평면도 렌더링 + 클릭 이벤트 처리. (선택된 공간(그룹)의 detail, 새로 클릭된 단일 guid) 반환.
+    새로 클릭된 guid는 항상 사용자가 실제로 클릭한 '단일' 공간이다(조닝 병합은 반대편에서만 적용됨)."""
     st.subheader(label)
     if storey_name is None or plan is None:
         st.info('이 층에 대응하는 층을 찾지 못했습니다 (층 매핑 없음).')
@@ -92,24 +103,22 @@ def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix):
 
     st.caption(f"공간 {len(plan['spaces'])}개 · 구조요소 {len(plan['structural'])}개  (층: {storey_name})")
 
-    selected_key = f'{session_prefix}_selected_guid'
-    selected_guid = st.session_state.get(selected_key)
+    selected_key = f'{session_prefix}_selected_guids'
+    selected_guids = st.session_state.get(selected_key) or []
 
+    entries = _get_selected_entries(plan, selected_guids)
     detail = None
-    sp_entry = None
-    if selected_guid:
-        sp_entry = next((s for s in plan['spaces'] if s['guid'] == selected_guid), None)
-        if sp_entry is not None:
-            detail = fc.build_space_detail(data['ifc_file'], data['wall_classification'], sp_entry['entity'])
+    if entries:
+        detail = fc.build_space_group_detail(data['ifc_file'], data['wall_classification'], entries)
 
     equipment_entities = None
     highlight_map = None
-    if detail is not None and sp_entry is not None:
+    if detail is not None:
         highlight_map = detail['highlight_map']
-        equipment_entities = fc.get_space_contained_equipment(data['ifc_file'], sp_entry['entity'])
+        equipment_entities = fc.get_group_contained_equipment(data['ifc_file'], [e['entity'] for e in entries])
 
     fig = fc.build_plan_figure(
-        plan, selected_guid=selected_guid,
+        plan, selected_guid=selected_guids,
         highlight_map=highlight_map, equipment_entities=equipment_entities,
     )
     event = st.plotly_chart(
@@ -120,19 +129,25 @@ def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix):
     new_guid = None
     if event and event.get('selection', {}).get('points'):
         g = _extract_customdata_guid(event['selection']['points'][0])
-        if g and g != selected_guid:
+        if g and [g] != selected_guids:
             new_guid = g
 
     if detail is not None:
         _render_legend()
-        st.markdown(f"**📍 {detail['name']}**" + (f" ({detail['long_name']})" if detail['long_name'] else ''))
+        title = f"**📍 {detail['name']}**"
+        if detail['is_group']:
+            title += f" _(자동매핑: {len(detail['guids'])}개 공간 병합)_"
+        st.markdown(title)
         c1, c2 = st.columns(2)
         with c1:
             st.metric('공간 면적(㎡)', detail['area'] if detail['area'] is not None else 'N/A')
             st.caption(f"산출방식: {detail['area_method']}")
         with c2:
-            st.caption(f"GlobalId: `{detail['guid']}`")
-    elif selected_guid:
+            if detail['is_group']:
+                st.caption("GlobalId: 여러 개 (병합그룹)")
+            else:
+                st.caption(f"GlobalId: `{detail['guid']}`")
+    elif selected_guids:
         st.warning('선택된 공간을 이 층에서 찾을 수 없습니다 (층이 바뀌었을 수 있음).')
     else:
         st.caption('평면도에서 공간을 클릭하면 상세 정보가 여기 표시됩니다.')
@@ -167,7 +182,7 @@ def _render_union_table(title, left_d, right_d, label_left, label_right,
 
 
 def _render_comparison_tables(detail_left, detail_right, label_left='전문가', label_right='AI'):
-    """선택된 두 공간(좌/우)의 지표를 합집합 기준 통일 테이블로 나란히 비교."""
+    """선택된 두 공간(좌/우, 그룹 가능)의 지표를 합집합 기준 통일 테이블로 나란히 비교."""
     if detail_left is None and detail_right is None:
         return
     st.markdown('---')
@@ -210,18 +225,25 @@ with st.sidebar:
         '면적 + centroid 좌표 오차 기준으로 자동 매핑',
         value=False,
         help='한쪽 평면도에서 공간을 클릭하면, 두 IFC의 좌표계 차이(평행이동)를 면적이 '
-             '비슷한 후보들로부터 자동 추정한 뒤, 그 오프셋을 보정한 centroid 거리와 면적 오차가 '
-             '둘 다 임계값 이내인 공간을 반대편에서 자동으로 찾아 함께 선택합니다.',
+             '비슷한 후보들로부터 자동 추정한 뒤, 그 오프셋을 보정한 centroid 거리가 가장 가까운 '
+             '공간을 반대편에서 찾습니다. 면적이 바로 안 맞으면(조닝이 다른 경우) 그 공간에 '
+             '인접한 공간들을 순차적으로 합쳐 면적이 맞는지 시도합니다.',
     )
     if auto_map_enabled:
         area_thresh = st.number_input('면적 오차 임계값 (㎡)', min_value=0.0, value=2.0, step=0.5)
         centroid_thresh = st.number_input('centroid 좌표 오차 임계값 (m)', min_value=0.0, value=1.0, step=0.1)
+        with st.expander('조닝 병합 옵션 (고급)'):
+            adjacency_tol = st.number_input('인접 판정 거리 허용오차 (m)', min_value=0.0, value=0.1, step=0.05,
+                                             help='두 공간의 경계가 이 거리 이내면 인접한 것으로 보고 병합 후보로 삼습니다.')
+            max_group = st.number_input('최대 병합 공간 개수', min_value=1, max_value=15, value=5, step=1)
         st.caption(
             '⚠️ 두 모델의 좌표계가 회전 없이 평행이동만 다르다고 가정합니다. '
-            '건물이 회전되어 모델링된 경우 이 방식이 맞지 않을 수 있습니다.'
+            '건물이 회전되어 모델링된 경우 이 방식이 맞지 않을 수 있습니다. '
+            '또한 오프셋 자체는 "바로 1:1로 맞는 공간"이 최소 몇 개는 있어야 추정 가능합니다 '
+            '(층 전체가 조닝이 다르면 오프셋 추정부터 실패할 수 있음).'
         )
     else:
-        area_thresh = centroid_thresh = None
+        area_thresh = centroid_thresh = adjacency_tol = max_group = None
 
 
 # ===================================================================
@@ -264,8 +286,8 @@ if file_a and file_b:
     # 층 선택이 바뀌면 이전 선택된 공간 정보는 초기화
     _cur_key = (selected_a_name, selected_b_name)
     if st.session_state.get('_last_storey_pair') != _cur_key:
-        st.session_state.pop('left_selected_guid', None)
-        st.session_state.pop('right_selected_guid', None)
+        st.session_state.pop('left_selected_guids', None)
+        st.session_state.pop('right_selected_guids', None)
         st.session_state['_last_storey_pair'] = _cur_key
 
     plan_a = _build_plan_cached(data_a['storeys'], selected_a_name, 'left')
@@ -275,12 +297,13 @@ if file_a and file_b:
     if auto_map_enabled:
         space_a_to_b, space_b_to_a, match_offset, match_info = _match_spaces_cached(
             plan_a['spaces'], plan_b['spaces'], area_thresh, centroid_thresh,
-            f'{selected_a_name}|{selected_b_name}',
+            adjacency_tol, max_group, f'{selected_a_name}|{selected_b_name}',
         )
         if match_offset:
+            n_merged = sum(1 for m in match_info if m['merged'])
             st.success(
-                f"공간 자동 매핑: {len(match_info)}쌍 매칭됨 "
-                f"(추정 좌표 오프셋 dx={match_offset[0]:.2f}m, dy={match_offset[1]:.2f}m)"
+                f"공간 자동 매핑: {len(match_info)}쌍 매칭됨 (그 중 조닝 병합 {n_merged}건) "
+                f"· 추정 좌표 오프셋 dx={match_offset[0]:.2f}m, dy={match_offset[1]:.2f}m"
             )
         else:
             st.warning('공간 자동 매핑: 매칭 후보를 찾지 못했습니다 (면적 임계값을 늘려보세요).')
@@ -295,15 +318,15 @@ if file_a and file_b:
 
     changed = False
     if new_left:
-        st.session_state['left_selected_guid'] = new_left
+        st.session_state['left_selected_guids'] = [new_left]
         changed = True
         if auto_map_enabled and new_left in space_a_to_b:
-            st.session_state['right_selected_guid'] = space_a_to_b[new_left]
+            st.session_state['right_selected_guids'] = space_a_to_b[new_left]
     if new_right:
-        st.session_state['right_selected_guid'] = new_right
+        st.session_state['right_selected_guids'] = [new_right]
         changed = True
         if auto_map_enabled and new_right in space_b_to_a:
-            st.session_state['left_selected_guid'] = space_b_to_a[new_right]
+            st.session_state['left_selected_guids'] = space_b_to_a[new_right]
     if changed:
         st.rerun()  # 하이라이트/자동매핑 반영을 위해 갱신된 session_state로 즉시 재실행
 
