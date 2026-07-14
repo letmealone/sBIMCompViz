@@ -353,6 +353,33 @@ def _wall_display_category(result):
     return '외부(판정됨)', result  # '외벽' / '외벽(추정)'
 
 
+_AREA_APPORTION_CLASSES = ('IfcSlab', 'IfcRoof', 'IfcCovering')
+_APPORTION_BUFFER_M = 0.3  # 공간 폴리곤을 이만큼(m) 부풀려서 부재 footprint와 겹치는 부분을 봄.
+# 실측으로 튜닝한 값: 한 공간에만 속한 짧은 벽/바닥은 이 정도면 거의 100% 잡히고,
+# 여러 공간에 걸친 긴 벽/바닥은 실제로 걸친 비율만큼만 낮게 나옴 (예: 방 하나에 딸린 벽은
+# 비율 1.0, 여러 방을 관통하는 긴 벽은 0.15~0.25 수준으로 나뉘어 원래 문제를 해결함).
+
+
+def _space_portion_fraction(member_entity, space_footprint, buffer_dist=_APPORTION_BUFFER_M):
+    """member_entity(벽/바닥/지붕/천장 등)의 footprint 중, space_footprint에 buffer_dist(m)만큼
+    부풀린 영역과 겹치는 비율(0~1)을 반환. 부재가 여러 공간에 걸쳐 있을 때 '이 공간에 해당하는
+    부분'만 면적에 반영하기 위한 안분 비율이다. 계산 실패(footprint 없음 등)시 None 반환
+    (호출부에서 안분 없이 전체 면적을 쓰도록 폴백)."""
+    if space_footprint is None or space_footprint.is_empty:
+        return None
+    member_footprint = get_footprint_polygon(member_entity)
+    if member_footprint is None or member_footprint.is_empty or member_footprint.area <= 0:
+        return None
+    try:
+        buffered_space = space_footprint.buffer(buffer_dist)
+        inter = member_footprint.intersection(buffered_space)
+    except Exception:
+        return None
+    if inter.is_empty:
+        return 0.0
+    return min(inter.area / member_footprint.area, 1.0)
+
+
 def build_space_detail(ifc_file, wall_classification, space_entity):
     """클릭된 Space 1개에 대한 요약 정보:
     - 접한 구조재 개수(전체) + 벽 내/외부 구분(좌우대칭 이진 + 상세근거 병기)
@@ -361,13 +388,17 @@ def build_space_detail(ifc_file, wall_classification, space_entity):
     """
     related = get_space_related_elements(ifc_file, space_entity)
     equipment = get_space_contained_equipment(ifc_file, space_entity)
+    space_footprint = get_footprint_polygon(space_entity)  # 안분 계산 기준(이 공간의 실제 바닥형상)
 
     class_counts = Counter(e.is_a() for e in related)
 
     # 벽 내/외부 구분 (좌우 대칭 이진) + 상세 판정(원래 4분류) 병기
+    # 면적은 벽 전체 값이 아니라 이 공간에 걸친 부분만 안분해서 합산한다 (여러 공간에 이어진
+    # 벽의 전체 길이가 그대로 잡히던 문제를 해결 - _space_portion_fraction 참고).
     wall_simple_counts = Counter()
     wall_simple_area = Counter()
     wall_detail_counts = Counter()
+    wall_area_apportioned = True  # 하나라도 안분 실패(폴백)하면 False로 내려 라벨에 표시
     for e in related:
         if not e.is_a('IfcWall'):
             continue
@@ -378,23 +409,42 @@ def build_space_detail(ifc_file, wall_classification, space_entity):
         flat = ite._flatten_psets(e)
         v = flat.get('Qto_WallBaseQuantities.Gross_Side_Area')
         if isinstance(v, (int, float)):
-            wall_simple_area[simple] += v
+            fraction = _space_portion_fraction(e, space_footprint)
+            if fraction is None:
+                wall_area_apportioned = False
+                fraction = 1.0  # 안분 계산 실패시 폴백: 전체 값 사용(과다산정 가능성 있음)
+            wall_simple_area[simple] += v * fraction
 
     # 벽 이외 관련 부재: 계산 가능한 모든 클래스에 대해 면적 산정 시도 ("가능한 경우"만 채워짐)
+    # 바닥/지붕/천장(IfcSlab/IfcRoof/IfcCovering)은 벽과 마찬가지로 여러 공간에 걸칠 수 있어
+    # footprint 안분을 적용한다. 기둥/문/창 등은 부재가 길이 방향으로 여러 공간에 나뉘는
+    # 개념이 아니라(양쪽 공간이 공유하는 고정된 개구부/단면) 전체 값을 그대로 쓴다.
     area_by_class = {}
     non_wall_classes = sorted(set(e.is_a() for e in related if not e.is_a('IfcWall')))
     for cls in non_wall_classes:
         ents = [e for e in related if e.is_a(cls)]
         total, n_ok = 0.0, 0
+        apportioned = cls in _AREA_APPORTION_CLASSES
+        any_fallback = False
         for e in ents:
             flat = ite._flatten_psets(e)
             cols = ite._area_columns(e, flat)
             if cols['면적(㎡)'] is not None:
-                total += cols['면적(㎡)']
+                fraction = 1.0
+                if apportioned:
+                    fraction = _space_portion_fraction(e, space_footprint)
+                    if fraction is None:
+                        any_fallback = True
+                        fraction = 1.0
+                total += cols['면적(㎡)'] * fraction
                 n_ok += 1
+        note = ''
+        if apportioned:
+            note = '(공간 귀속분 안분)' if not any_fallback else '(일부 안분실패-전체값 폴백)'
         area_by_class[cls] = {
             '면적합계(㎡)': round(total, 2) if n_ok else None,
             '산출가능/전체': f'{n_ok}/{len(ents)}',
+            '비고': note,
         }
 
     # 설비 개수 (구조재와 별도 집계)
@@ -420,6 +470,7 @@ def build_space_detail(ifc_file, wall_classification, space_entity):
         'class_counts': dict(class_counts),
         'wall_simple_counts': dict(wall_simple_counts),
         'wall_simple_area': {k: round(v, 2) for k, v in wall_simple_area.items()},
+        'wall_area_note': '(공간 귀속분 안분)' if wall_area_apportioned else '(일부 안분실패-전체값 폴백 포함)',
         'wall_detail_counts': dict(wall_detail_counts),
         'area_by_class': area_by_class,
         'equipment_counts': dict(equipment_counts),

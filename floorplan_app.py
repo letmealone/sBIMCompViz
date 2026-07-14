@@ -247,7 +247,6 @@ def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix, 
             new_guid = g
 
     if detail is not None:
-        _render_legend()
         badge = f" `[{pair_labels[detail['guid']]}번]`" if pair_labels and detail['guid'] in pair_labels else ''
         st.markdown(f"**📍 {detail['name']}**{badge}" + (f" ({detail['long_name']})" if detail['long_name'] else ''))
         c1, c2 = st.columns(2)
@@ -317,10 +316,19 @@ def _render_comparison_tables(detail_left, detail_right, label_left='전문가',
                          label_left, label_right,
                          extra_left=dl.get('wall_simple_area', {}), extra_right=dr.get('wall_simple_area', {}),
                          extra_label='합산면적(㎡)')
+    st.caption(
+        f"💡 벽 면적은 여러 공간에 걸친 벽의 경우 이 공간에 해당하는 부분만 안분해서 합산합니다 "
+        f"({label_left}: {dl.get('wall_area_note', '')} · {label_right}: {dr.get('wall_area_note', '')})"
+    )
 
     area_l = {k: v['면적합계(㎡)'] for k, v in dl.get('area_by_class', {}).items()}
     area_r = {k: v['면적합계(㎡)'] for k, v in dr.get('area_by_class', {}).items()}
     _render_union_table('벽 이외 부재 유형별 합산 면적(㎡)', area_l, area_r, label_left, label_right)
+    apportion_notes = {k: v['비고'] for k, v in dl.get('area_by_class', {}).items() if v.get('비고')}
+    apportion_notes.update({k: v['비고'] for k, v in dr.get('area_by_class', {}).items() if v.get('비고')})
+    if apportion_notes:
+        st.caption('💡 바닥/지붕/천장(IfcSlab/IfcRoof/IfcCovering)도 여러 공간에 걸친 경우 이 공간 몫만 안분: '
+                   + ', '.join(f'{k}{v}' for k, v in apportion_notes.items()))
 
     _render_union_table('설비 개수', dl.get('equipment_counts', {}), dr.get('equipment_counts', {}),
                          label_left, label_right)
@@ -454,6 +462,9 @@ if file_a and file_b:
     with col_right:
         detail_right, new_right = _render_plot_and_get_detail(
             'AI IFC', data_b, selected_b_name, plan_b, 'right', pair_labels=pair_labels_b)
+
+    if detail_left is not None or detail_right is not None:
+        _render_legend()
 
     changed = False
     if new_left:
