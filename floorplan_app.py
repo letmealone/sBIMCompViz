@@ -107,6 +107,11 @@ def _clear_all_caches():
     for key in list(st.session_state.keys()):
         if key.startswith((_SESSION_CACHE_PREFIX, 'left_', 'right_', '_last_storey_pair', '_file_hash_')):
             del st.session_state[key]
+    # 층 선택 드롭다운은 위 접두사에 안 걸리므로 별도로 명시해서 초기화
+    # (안 지우면 새 파일 업로드 후에도 이전 파일에서 고른 층 이름이 그대로 남아
+    # "이전 IFC 정보가 남아있는 것처럼 보이는" 문제의 원인이 된다)
+    st.session_state.pop('storey_select_a', None)
+    st.session_state.pop('storey_select_b', None)
 
 
 def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix, pair_labels=None):
