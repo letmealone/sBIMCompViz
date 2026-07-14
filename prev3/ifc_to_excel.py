@@ -720,57 +720,6 @@ def run_ifc4_naming_diagnosis(ifc_file, llm_call, target_classes=None, batch_siz
 #      사유를 자동분류: ①구조상 비대상 클래스 / ②해당층에 Space없음 / ③매칭누락의심
 # ===================================================================
 
-# ===================================================================
-# 3-2b. RelSpaceBoundary 중복 진단
-#   실측으로 확인된 사실: 같은 부재(벽/기둥/문/창 등) 하나가 하나의 Space와 여러 개의
-#   별도 경계면(RelSpaceBoundary 레코드)으로 연결되는 경우가 있어, "관계 건수"를 그대로
-#   개수로 쓰면 실제 물리적 개체 수보다 과다 집계된다 (예: 표본 파일에서 IfcWall은
-#   744건 관계 중 실제 고유 개체는 438개 - 초과 306건, IfcColumn도 329건 중 82개 - 초과 247건).
-#   04_공간-부재_매칭(1대1) 시트는 의도적으로 "관계 1건 = 1행"으로 그대로 보여주므로
-#   (경계 데이터 자체를 살펴보기 위한 상세 시트), 그 시트의 행 수를 그대로 개수로 읽으면
-#   안 된다는 것을 이 진단 시트로 함께 확인할 수 있게 한다.
-# ===================================================================
-
-def _build_relspaceboundary_duplication_report(ifc_file):
-    """(Space, 부재) 쌍 기준으로, 같은 부재가 '같은 공간'에 RelSpaceBoundary로 여러 번
-    중복 연결되는 경우를 클래스별로 집계한다.
-    주의: 한 부재가 서로 다른 여러 공간에 연결되는 것은 정상이며 중복이 아니다(예: 방 2개에
-    접한 벽은 관계가 2건 있는 게 맞음). 여기서는 '같은 (공간, 부재) 쌍'이 몇 번 반복되는지만
-    보며, 이게 1보다 크면 get_space_related_elements()가 dedup해야 하는 진짜 중복이다."""
-    pair_count = defaultdict(int)
-    elem_class = {}
-    for r in ifc_file.by_type('IfcRelSpaceBoundary'):
-        elem = r.RelatedBuildingElement
-        sp = r.RelatingSpace
-        if elem is None or sp is None:
-            continue
-        pair_count[(sp.GlobalId, elem.GlobalId)] += 1
-        elem_class[elem.GlobalId] = elem.is_a()
-
-    raw_by_class = defaultdict(int)
-    unique_pairs_by_class = defaultdict(int)
-    for (sp_guid, elem_guid), cnt in pair_count.items():
-        cls = elem_class[elem_guid]
-        raw_by_class[cls] += cnt
-        unique_pairs_by_class[cls] += 1
-
-    rows = []
-    for cls in sorted(set(raw_by_class) | set(unique_pairs_by_class)):
-        raw = raw_by_class[cls]
-        uniq = unique_pairs_by_class[cls]
-        rows.append({
-            'IFC_Class': cls,
-            '원시_관계건수': raw,
-            '고유_공간-부재쌍_수': uniq,
-            '초과분(같은공간에중복연결)': raw - uniq,
-            '중복여부': '있음' if raw > uniq else '없음',
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values('초과분(같은공간에중복연결)', ascending=False).reset_index(drop=True)
-    return df
-
-
 def _build_unmatched_elements(ifc_file):
     rsb = ifc_file.by_type('IfcRelSpaceBoundary')
     matched_guids = {rel.RelatedBuildingElement.GlobalId
@@ -1261,7 +1210,7 @@ def extract_ifc_to_excel(ifc_path: str, output_path: str = None, include_long: b
         '전체속성' 셀에서 명세에 정의된 (Pset/Class, 속성) 에 해당하는 줄을 빨간 굵은 글씨로 강조.
     naming_diagnosis : bool, default False
         True면 NVIDIA NIM LLM으로 (IFC_Class, Name) 고유 조합이 IFC4 표준 의도와 부합하는지
-        추론 진단해 '08_IFC4_명명규칙_진단' 시트를 추가한다. nvidia_api_key가 없으면 건너뛴다.
+        추론 진단해 '07_IFC4_명명규칙_진단' 시트를 추가한다. nvidia_api_key가 없으면 건너뛴다.
         주의: 이는 LLM 추론이며 확정된 오류 판정이 아니다(검토 참고용 의심목록).
     naming_diagnosis_classes : list[str], optional
         진단 대상 IFC_Class 제한 목록. None이면 전체 IfcElement 대상(기본값, 비용이 커질 수 있음).
@@ -1327,10 +1276,6 @@ def extract_ifc_to_excel(ifc_path: str, output_path: str = None, include_long: b
         ws = wb.create_sheet(_unique_sheet_name(wb, '06_벽_내외벽_판정', used_names))
         _write_df(ws, df_wall_class)
 
-        df_dup = _build_relspaceboundary_duplication_report(ifc_file)
-        ws = wb.create_sheet(_unique_sheet_name(wb, '07_RelSpaceBoundary_중복진단', used_names))
-        _write_df(ws, df_dup)
-
     if per_class_wide:
         wide_sheets = _build_wide_sheets(ifc_file)
         for sheet_label, df in wide_sheets.items():
@@ -1345,7 +1290,7 @@ def extract_ifc_to_excel(ifc_path: str, output_path: str = None, include_long: b
             df_diag = run_ifc4_naming_diagnosis(
                 ifc_file, llm_call, target_classes=naming_diagnosis_classes, status_cb=status_cb
             )
-            ws = wb.create_sheet(_unique_sheet_name(wb, '08_IFC4_명명규칙_진단', used_names))
+            ws = wb.create_sheet(_unique_sheet_name(wb, '07_IFC4_명명규칙_진단', used_names))
             _write_df(ws, df_diag)
 
     wb.save(output_path)
