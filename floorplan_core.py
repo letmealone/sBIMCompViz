@@ -338,13 +338,16 @@ def get_space_contained_equipment(ifc_file, space_entity, classes=EQUIPMENT_CLAS
 
 
 def _wall_display_category(result):
-    """내/외벽 판정을 표시용 카테고리로 변환 (3분류):
-    - '내벽' -> '내부'
-    - '판정불가'(1차 Pset도 없고 2차 지오메트리 근거도 없음) -> '외부(판정불가)'
-    - 그 외('외벽'=1차 Pset 확정, '외벽(추정)'=2차 지오메트리 확정) -> '외부(판정됨)'
-    즉 외벽을 '실제로 판정된 것'과 '판정할 근거가 없어 외부로 편입된 것'을 구분해서 보여준다."""
+    """내/외벽 판정을 표시용 카테고리로 변환 (4분류):
+    - '내벽' -> '내부' (1차/2차로 확정)
+    - '내벽(추정-관계기반)' -> '내부(추정)' (3차, ConnectionGeometry 없이 관계 개수만으로 추정 - 확정보다 약함)
+    - '판정불가'(1차/2차/3차 모두 근거 없음) -> '외부(판정불가)'
+    - 그 외('외벽'=1차 확정, '외벽(추정)'=2차 확정) -> '외부(판정됨)'
+    즉 외벽/내벽 모두 '확정'과 '추정/근거없음'을 구분해서 보여준다."""
     if result == '내벽':
         return '내부', '내벽'
+    if result == '내벽(추정-관계기반)':
+        return '내부(추정)', result
     if result == '판정불가':
         return '외부(판정불가)', '외벽(판정불가)'
     return '외부(판정됨)', result  # '외벽' / '외벽(추정)'
@@ -427,14 +430,23 @@ def build_space_detail(ifc_file, wall_classification, space_entity):
 
 def _build_highlight_map(related, equipment, wall_classification):
     """평면도에서 색을 다르게 칠하기 위한 GlobalId -> 카테고리 매핑.
-    카테고리: 'wall_internal'(내벽) / 'wall_external'(외벽, 판정불가 포함) /
+    카테고리: 'wall_internal'(내벽, 1차/2차 확정) / 'wall_internal_estimated'(내벽 추정-관계기반, 3차) /
+              'wall_external_confirmed'(외벽, 1차/2차로 확정) /
+              'wall_external_unknown'(판정불가로 외부 편입된 것 - 근거 없음, 구분 표시) /
               'related'(벽 이외 경계 관련 부재) / 'equipment'(조명/센서/소방설비)."""
     hl = {}
     for e in related:
         if e.is_a('IfcWall'):
             result, _ = wall_classification.get(e.GlobalId, ('판정불가', ''))
             simple, _ = _wall_display_category(result)
-            hl[e.GlobalId] = 'wall_internal' if simple == '내부' else 'wall_external'
+            if simple == '내부':
+                hl[e.GlobalId] = 'wall_internal'
+            elif simple == '내부(추정)':
+                hl[e.GlobalId] = 'wall_internal_estimated'
+            elif simple == '외부(판정불가)':
+                hl[e.GlobalId] = 'wall_external_unknown'
+            else:
+                hl[e.GlobalId] = 'wall_external_confirmed'
         else:
             hl[e.GlobalId] = 'related'
     for e in equipment:
@@ -461,9 +473,11 @@ _FADED_LINE = 'rgba(190,190,190,0.5)'
 
 # 공간 클릭시 하이라이트 색상 (카테고리별로 뚜렷이 구분)
 _HIGHLIGHT_COLORS = {
-    'wall_internal': ('rgba(30,110,230,0.85)', 'rgba(15,70,160,1.0)'),   # 내벽 = 파랑
-    'wall_external': ('rgba(230,90,30,0.85)', 'rgba(170,60,10,1.0)'),    # 외벽(판정불가 포함) = 주황
-    'related': ('rgba(160,50,190,0.75)', 'rgba(110,20,140,1.0)'),        # 벽 이외 관련부재 = 보라
+    'wall_internal': ('rgba(30,110,230,0.85)', 'rgba(15,70,160,1.0)'),              # 내벽(확정) = 진한 파랑
+    'wall_internal_estimated': ('rgba(120,180,240,0.75)', 'rgba(60,120,190,1.0)'),  # 내벽(추정-관계기반) = 연한 파랑
+    'wall_external_confirmed': ('rgba(230,90,30,0.85)', 'rgba(170,60,10,1.0)'),     # 외벽(판정됨) = 주황
+    'wall_external_unknown': ('rgba(230,190,190,0.85)', 'rgba(160,50,50,1.0)'),     # 외벽(판정불가) = 연한 붉은/분홍(주황과 구분)
+    'related': ('rgba(160,50,190,0.75)', 'rgba(110,20,140,1.0)'),                   # 벽 이외 관련부재 = 보라
 }
 _EQUIPMENT_COLOR = 'rgba(220,190,20,0.95)'  # 설비(조명/센서/소방) = 노랑 마커
 

@@ -480,10 +480,31 @@ def _wall_both_sides_space_check(ifc_file):
     return result
 
 
+def _wall_distinct_space_count(ifc_file):
+    """벽 GlobalId -> RelSpaceBoundary 관계로 연결된 서로 다른 Space GlobalId 개수.
+    ConnectionGeometry 유무와 무관하게 '관계'만 본다 (3차 판정용, 2차보다 근거가 약함).
+    주의(알려진 한계): 벽 하나의 같은 면이 여러 방을 순서대로 접해도 관계상 여러 Space로
+    잡히므로, 이 개수만으로는 '진짜 양쪽 분리'와 '한쪽 면이 여러 방과 연속 접함'을 완벽히
+    구분하지 못한다. ConnectionGeometry가 아예 없어 2차 판정 자체가 불가능한 경우에만
+    판정불가보다 나은 참고 정보로 사용한다."""
+    counts = defaultdict(set)
+    for r in ifc_file.by_type('IfcRelSpaceBoundary'):
+        elem = r.RelatedBuildingElement
+        if elem is None or not elem.is_a('IfcWall') or r.RelatingSpace is None:
+            continue
+        counts[elem.GlobalId].add(r.RelatingSpace.GlobalId)
+    return {gid: len(spaces) for gid, spaces in counts.items()}
+
+
 def _determine_wall_classification(ifc_file):
-    """벽 GlobalId -> ('내벽'/'외벽'/'외벽(추정)'/'판정불가', 판정근거) 딕셔너리.
-    1차: Pset_WallCommon.IsExternal. 2차(1차 없을 때만): 양쪽 면 Space 접촉 여부."""
+    """벽 GlobalId -> ('내벽'/'외벽'/'외벽(추정)'/'내벽(추정-관계기반)'/'판정불가', 판정근거) 딕셔너리.
+    1차: Pset_WallCommon.IsExternal.
+    2차(1차 없을 때만): RelSpaceBoundary.ConnectionGeometry 기반 양면 Space 접촉 확인.
+    3차(1차/2차 모두 근거 없을 때만, 예: ConnectionGeometry 자체가 파일에 없는 경우):
+        지오메트리 없이 RelSpaceBoundary '관계'만으로 서로 다른 Space에 2개 이상 연결되는지
+        확인. 2차보다 근거가 약해 '추정-관계기반'으로 명확히 구분 표시한다."""
     both_sides = _wall_both_sides_space_check(ifc_file)
+    distinct_space_count = _wall_distinct_space_count(ifc_file)
     result = {}
     for w in ifc_file.by_type('IfcWall'):
         gid = w.GlobalId
@@ -497,8 +518,13 @@ def _determine_wall_classification(ifc_file):
                 result[gid] = ('내벽', '2차: RelSpaceBoundary 양면 Space 접촉 확인')
             else:
                 result[gid] = ('외벽(추정)', '2차: 한쪽 면만 Space 접촉 → 외벽으로 추정(반대면 Space 경계 없음)')
+        elif distinct_space_count.get(gid, 0) >= 2:
+            n = distinct_space_count[gid]
+            result[gid] = ('내벽(추정-관계기반)',
+                           f'3차: ConnectionGeometry 없음, RelSpaceBoundary 관계상 서로 다른 Space {n}개와 '
+                           f'연결됨(지오메트리 미확인 - 같은 면이 여러 방과 연속 접한 경우일 수도 있어 추정치임)')
         else:
-            result[gid] = ('판정불가', '1차/2차 모두 근거 데이터 없음')
+            result[gid] = ('판정불가', '1차/2차/3차 모두 근거 데이터 없음')
     return result
 
 
