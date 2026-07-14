@@ -17,9 +17,6 @@ from shapely.ops import unary_union
 
 import ifc_to_excel as ite  # 내외벽 판정(_determine_wall_classification), 면적계산(_area_columns) 등 재사용
 
-_SETTINGS = geom.settings()
-_SETTINGS.set('use-world-coords', True)
-
 # 평면도에 그릴 대상 클래스. Space는 클릭 가능(색상 채움), 나머지는 참고용 윤곽선만 표시.
 PLAN_STRUCTURAL_CLASSES = (
     'IfcWall', 'IfcWallStandardCase', 'IfcColumn', 'IfcBeam',
@@ -193,31 +190,45 @@ def match_spaces(spaces_a, spaces_b, area_thresh=2.0, centroid_thresh=1.0):
 def get_footprint_polygon(ent, tol=0.05):
     """엔티티의 바닥면(최저 Z 근처) 삼각형들을 shapely로 합쳐 실제 footprint 폴리곤 반환.
     형상이 없거나 계산 실패시 None. tol: 바닥면으로 간주할 Z 허용오차(m)."""
+    # [수정] 스레드 안전성(Thread-safety) 보장을 위해 지역 변수로 설정 생성
+    settings = geom.settings()
+    settings.set('use-world-coords', True)
+    
     try:
-        shape = geom.create_shape(_SETTINGS, ent)
+        shape = geom.create_shape(settings, ent)
     except Exception:
         return None
+        
     verts = np.array(shape.geometry.verts).reshape(-1, 3)
     faces = np.array(shape.geometry.faces).reshape(-1, 3)
     if len(verts) == 0 or len(faces) == 0:
         return None
+        
     zmin = verts[:, 2].min()
     polys = []
+    
     for tri in faces:
         p = verts[tri]
         if np.all(p[:, 2] <= zmin + tol):
             try:
                 poly = Polygon(p[:, :2])
+                # [수정] Shapely의 TopologicalError(꼬인 다각형 등) 방지
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                
                 if poly.is_valid and poly.area > 1e-9:
                     polys.append(poly)
             except Exception:
                 continue
+                
     if not polys:
         return None
+        
     try:
         u = unary_union(polys)
     except Exception:
         return None
+        
     if u.is_empty:
         return None
     return u
@@ -252,7 +263,12 @@ def _polygon_xy_lists(poly):
 
     geoms = poly.geoms if poly.geom_type == 'MultiPolygon' else [poly]
     for g in geoms:
-        _add_ring(list(g.exterior.coords))
+        # [수정] 외곽선뿐만 아니라 폴리곤 내부의 개구부/구멍(interiors)도 추출
+        if g.exterior:
+            _add_ring(list(g.exterior.coords))
+        for interior in g.interiors:
+            _add_ring(list(interior.coords))
+            
     return xs, ys
 
 
@@ -434,18 +450,6 @@ def _build_highlight_map(related, equipment, wall_classification):
         hl[e.GlobalId] = 'equipment'
     return hl
 
-    return {
-        'name': space_entity.Name or '(이름없음)',
-        'long_name': space_entity.LongName,
-        'guid': space_entity.GlobalId,
-        'area': round(space_area, 2) if space_area is not None else None,
-        'area_method': space_area_method,
-        'class_counts': dict(class_counts),
-        'wall_class_counts': dict(wall_class_counts),
-        'wall_area_by_class': {k: round(v, 2) for k, v in wall_area_by_class.items()},
-        'area_by_class': area_by_class,
-    }
-
 
 # ===================================================================
 # 5. Plotly 평면도 figure 생성
@@ -477,38 +481,9 @@ _SPACE_FILL_SELECTED = 'rgba(230,100,60,0.55)'
 _SPACE_LINE = 'rgba(60,140,80,0.9)'
 _SPACE_LINE_SELECTED = 'rgba(200,60,20,1.0)'
 
-_SPACE_UNMATCHED_FILL = 'rgba(190,190,190,0.35)'
-_SPACE_UNMATCHED_LINE = 'rgba(150,150,150,0.8)'
-
-# 공간 자동매핑 쌍 표시용 색상 팔레트 (양쪽 평면도에서 같은 번호는 항상 같은 색)
-_PAIR_PALETTE = [
-    'rgba(31,119,180,0.45)', 'rgba(255,127,14,0.45)', 'rgba(44,160,44,0.45)',
-    'rgba(214,39,40,0.45)', 'rgba(148,103,189,0.45)', 'rgba(140,86,75,0.45)',
-    'rgba(227,119,194,0.45)', 'rgba(127,127,127,0.45)', 'rgba(188,189,34,0.45)',
-    'rgba(23,190,207,0.45)',
-]
-_PAIR_PALETTE_LINE = [
-    'rgba(31,119,180,1.0)', 'rgba(255,127,14,1.0)', 'rgba(44,160,44,1.0)',
-    'rgba(214,39,40,1.0)', 'rgba(148,103,189,1.0)', 'rgba(140,86,75,1.0)',
-    'rgba(227,119,194,1.0)', 'rgba(127,127,127,1.0)', 'rgba(188,189,34,1.0)',
-    'rgba(23,190,207,1.0)',
-]
-
-
-def build_pair_labels(a_to_b):
-    """match_spaces()가 반환한 a_to_b({A GlobalId: B GlobalId}) 딕셔너리로부터,
-    양쪽 평면도에 표시할 번호 라벨을 한번에 생성한다 (같은 쌍은 항상 같은 번호).
-    반환: (a_labels, b_labels) - 각각 {GlobalId: 번호} 딕셔너리."""
-    a_labels, b_labels = {}, {}
-    for i, (a_guid, b_guid) in enumerate(a_to_b.items(), start=1):
-        a_labels[a_guid] = i
-        if b_guid:
-            b_labels[b_guid] = i
-    return a_labels, b_labels
-
 
 def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None,
-                       highlight_map=None, equipment_entities=None, pair_labels=None):
+                       highlight_map=None, equipment_entities=None):
     """plan_data(build_storey_plan_data 반환값)로 Plotly Figure 생성.
 
     Space는 내부에 보이지 않는 마커 격자를 깔아 '폴리곤 내부 아무 곳이나 클릭'해도
@@ -521,16 +496,10 @@ def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None,
         한눈에 구분되도록 한다. None이면(선택 없음) 기본 클래스별 색상으로 표시.
     equipment_entities: 선택된 Space '안에' 있는 설비(조명/센서/소방장치 등) ifcopenshell 엔티티
         목록. 평면도에 노란 마커로 추가 표시한다 (RelSpaceBoundary 대상이 아니라 별도로 그림).
-    pair_labels: build_pair_labels()가 반환한 {GlobalId: 번호} 딕셔너리(이 평면도 쪽).
-        주어지면(자동매핑 활성화시) 매칭된 공간마다 같은 번호 배지+같은 계열 색상을 칠해
-        양쪽 평면도에서 어떤 공간끼리 매칭됐는지 클릭 없이도 한눈에 보이게 한다.
-        매칭 안 된 공간은 회색으로 표시해 구분한다. None이면(자동매핑 비활성화) 기존
-        기본 초록색 표시로 돌아간다.
     """
     import plotly.graph_objects as go
     fig = go.Figure()
     highlight_map = highlight_map or {}
-    pair_labels = pair_labels or {}
 
     # 구조요소(벽/기둥/보/바닥 등)
     for el in plan_data['structural']:
@@ -552,36 +521,18 @@ def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None,
             showlegend=False,
         ))
 
-    # Space: 시각적 채움(폴리곤) + 클릭 히트영역(격자 마커, 투명) + (선택) 매칭쌍 번호배지
-    badge_x, badge_y, badge_text, badge_color, badge_line = [], [], [], [], []
+    # Space: 시각적 채움(폴리곤) + 클릭 히트영역(격자 마커, 투명)
     for sp in plan_data['spaces']:
         is_sel = (selected_guid is not None and sp['guid'] == selected_guid)
-        pair_no = pair_labels.get(sp['guid'])
-
-        if is_sel:
-            fill_c, line_c, line_w = _SPACE_FILL_SELECTED, _SPACE_LINE_SELECTED, 1.5
-        elif pair_no is not None:
-            idx = (pair_no - 1) % len(_PAIR_PALETTE)
-            fill_c, line_c, line_w = _PAIR_PALETTE[idx], _PAIR_PALETTE_LINE[idx], 1.2
-        elif pair_labels:  # 자동매핑은 켜져있는데 이 공간은 매칭 안 됨
-            fill_c, line_c, line_w = _SPACE_UNMATCHED_FILL, _SPACE_UNMATCHED_LINE, 1.0
-        else:
-            fill_c, line_c, line_w = _SPACE_FILL, _SPACE_LINE, 1.0
+        fill_c = _SPACE_FILL_SELECTED if is_sel else _SPACE_FILL
+        line_c = _SPACE_LINE_SELECTED if is_sel else _SPACE_LINE
 
         xs, ys = _polygon_xy_lists(sp['polygon'])
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode='lines', fill='toself',
-            line=dict(width=line_w, color=line_c), fillcolor=fill_c,
+            line=dict(width=1.5 if is_sel else 1.0, color=line_c), fillcolor=fill_c,
             hoverinfo='skip', showlegend=False,
         ))
-
-        if pair_no is not None:
-            c = sp['polygon'].centroid
-            idx = (pair_no - 1) % len(_PAIR_PALETTE)
-            badge_x.append(c.x); badge_y.append(c.y)
-            badge_text.append(str(pair_no))
-            badge_color.append(_PAIR_PALETTE_LINE[idx])
-            badge_line.append('white')
 
         pts = _grid_points_in_polygon(sp['polygon'], spacing=click_grid_spacing)
         gx, gy = zip(*pts)
@@ -591,14 +542,6 @@ def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None,
             customdata=[sp['guid']] * len(pts),
             hovertemplate=f"{sp['name']}<br>면적 약 {round(sp['polygon'].area,1)}㎡<extra></extra>",
             showlegend=False,
-        ))
-
-    if badge_x:
-        fig.add_trace(go.Scatter(
-            x=badge_x, y=badge_y, mode='markers+text',
-            marker=dict(size=22, color=badge_color, line=dict(width=1.5, color=badge_line)),
-            text=badge_text, textfont=dict(color='white', size=12, family='Arial Black'),
-            hoverinfo='skip', showlegend=False,
         ))
 
     # 설비(조명/센서/소방장치): 선택된 Space 안에 있는 것만 노란 마커로 표시
@@ -635,4 +578,3 @@ def build_plan_figure(plan_data, click_grid_spacing=0.5, selected_guid=None,
         clickmode='event+select',
     )
     return fig
-

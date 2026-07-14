@@ -109,8 +109,8 @@ def _clear_all_caches():
             del st.session_state[key]
 
 
-def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix, pair_labels=None):
-    """평면도 렌더링 + 클릭/드롭다운 선택 처리. (선택된 공간의 detail, 새로 클릭/선택된 guid) 반환."""
+def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix):
+    """평면도 렌더링 + 클릭 이벤트 처리. (선택된 공간의 detail, 새로 클릭된 guid) 반환."""
     st.subheader(label)
     if storey_name is None or plan is None:
         st.info('이 층에 대응하는 층을 찾지 못했습니다 (층 매핑 없음).')
@@ -120,29 +120,6 @@ def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix, 
 
     selected_key = f'{session_prefix}_selected_guid'
     selected_guid = st.session_state.get(selected_key)
-
-    # 드롭다운으로 직접 선택 (클릭이 여러 번 필요해 불편한 경우를 위한 안정적인 대안 경로.
-    # 기존 클릭 방식은 그대로 두고 "추가"하는 것이라 기존 동작에는 영향이 없다)
-    dropdown_key = f'{session_prefix}_space_dropdown'
-    space_options = [''] + [s['guid'] for s in plan['spaces']]
-    guid_to_name = {s['guid']: s['name'] for s in plan['spaces']}
-    guid_to_area = {s['guid']: s['polygon'].area for s in plan['spaces']}
-
-    def _fmt_space_option(guid):
-        if not guid:
-            return '(선택 안 함)'
-        prefix = f"[{pair_labels[guid]}번] " if pair_labels and guid in pair_labels else ''
-        return f"{prefix}{guid_to_name.get(guid, '?')} ({guid_to_area.get(guid, 0):.1f}㎡)"
-
-    # 클릭으로 바뀐 선택과 드롭다운 위젯 상태가 항상 일치하도록 동기화
-    if st.session_state.get(dropdown_key) != (selected_guid or ''):
-        st.session_state[dropdown_key] = selected_guid or ''
-
-    dropdown_guid = st.selectbox(
-        '공간 직접 선택', space_options, format_func=_fmt_space_option, key=dropdown_key,
-        help='평면도 클릭이 잘 안 될 때 여기서 바로 선택할 수 있습니다. 자동매핑이 켜져있으면 '
-             '번호가 매겨진 항목이 반대편과 매칭된 공간입니다.',
-    )
 
     detail = None
     sp_entry = None
@@ -160,26 +137,21 @@ def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix, 
     fig = fc.build_plan_figure(
         plan, selected_guid=selected_guid,
         highlight_map=highlight_map, equipment_entities=equipment_entities,
-        pair_labels=pair_labels,
     )
     event = st.plotly_chart(
         fig, key=f'{session_prefix}_plot', on_select='rerun',
         selection_mode=('points',), use_container_width=True,
     )
 
-    # 새 선택 판단: 드롭다운에서 바뀌었으면 그걸 우선, 아니면 클릭 이벤트를 확인
     new_guid = None
-    if dropdown_guid and dropdown_guid != selected_guid:
-        new_guid = dropdown_guid
-    elif event and event.get('selection', {}).get('points'):
+    if event and event.get('selection', {}).get('points'):
         g = _extract_customdata_guid(event['selection']['points'][0])
         if g and g != selected_guid:
             new_guid = g
 
     if detail is not None:
         _render_legend()
-        badge = f" `[{pair_labels[detail['guid']]}번]`" if pair_labels and detail['guid'] in pair_labels else ''
-        st.markdown(f"**📍 {detail['name']}**{badge}" + (f" ({detail['long_name']})" if detail['long_name'] else ''))
+        st.markdown(f"**📍 {detail['name']}**" + (f" ({detail['long_name']})" if detail['long_name'] else ''))
         c1, c2 = st.columns(2)
         with c1:
             st.metric('공간 면적(㎡)', detail['area'] if detail['area'] is not None else 'N/A')
@@ -189,7 +161,7 @@ def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix, 
     elif selected_guid:
         st.warning('선택된 공간을 이 층에서 찾을 수 없습니다 (층이 바뀌었을 수 있음).')
     else:
-        st.caption('평면도에서 공간을 클릭하거나, 위 드롭다운에서 선택하면 상세 정보가 여기 표시됩니다.')
+        st.caption('평면도에서 공간을 클릭하면 상세 정보가 여기 표시됩니다.')
 
     return detail, new_guid
 
@@ -349,29 +321,21 @@ if file_a and file_b:
     if st.session_state.get('_last_storey_pair') != _cur_key:
         st.session_state.pop('left_selected_guid', None)
         st.session_state.pop('right_selected_guid', None)
-        st.session_state.pop('left_space_dropdown', None)
-        st.session_state.pop('right_space_dropdown', None)
         st.session_state['_last_storey_pair'] = _cur_key
 
     plan_a = _build_plan_cached(data_a['storeys'], selected_a_name, f'left_{file_hash_a}')
     plan_b = _build_plan_cached(data_b['storeys'], selected_b_name, f'right_{file_hash_b}')
 
     space_a_to_b, space_b_to_a = {}, {}
-    pair_labels_a, pair_labels_b = None, None
     if auto_map_enabled:
         space_a_to_b, space_b_to_a, match_offset, match_info = _match_spaces_cached(
             plan_a['spaces'], plan_b['spaces'], area_thresh, centroid_thresh,
             f'{file_hash_a}_{selected_a_name}|{file_hash_b}_{selected_b_name}',
         )
         if match_offset:
-            pair_labels_a, pair_labels_b = fc.build_pair_labels(space_a_to_b)
             st.success(
-                f"공간 자동 매핑: {len(match_info)}쌍 매칭됨 (평면도에 같은 번호·색상으로 표시됩니다) "
-                f"· 추정 좌표 오프셋 dx={match_offset[0]:.2f}m, dy={match_offset[1]:.2f}m"
-            )
-            st.caption(
-                '평면도의 색칠된 숫자 배지는 매칭된 공간 쌍입니다 (양쪽에서 같은 번호=같은 색). '
-                '⬜ 회색은 반대편에서 대응되는 공간을 찾지 못한 경우입니다.'
+                f"공간 자동 매핑: {len(match_info)}쌍 매칭됨 "
+                f"(추정 좌표 오프셋 dx={match_offset[0]:.2f}m, dy={match_offset[1]:.2f}m)"
             )
         else:
             st.warning('공간 자동 매핑: 매칭 후보를 찾지 못했습니다 (면적 임계값을 늘려보세요).')
@@ -379,10 +343,10 @@ if file_a and file_b:
     col_left, col_right = st.columns(2)
     with col_left:
         detail_left, new_left = _render_plot_and_get_detail(
-            '전문가 IFC', data_a, selected_a_name, plan_a, 'left', pair_labels=pair_labels_a)
+            '전문가 IFC', data_a, selected_a_name, plan_a, 'left')
     with col_right:
         detail_right, new_right = _render_plot_and_get_detail(
-            'AI IFC', data_b, selected_b_name, plan_b, 'right', pair_labels=pair_labels_b)
+            'AI IFC', data_b, selected_b_name, plan_b, 'right')
 
     changed = False
     if new_left:
