@@ -310,12 +310,18 @@ EQUIPMENT_CLASSES = ('IfcLightFixture', 'IfcSensor', 'IfcFireSuppressionTerminal
 
 
 def get_space_related_elements(ifc_file, space_entity):
-    """해당 Space와 RelSpaceBoundary로 연결된 부재 목록 (벽/기둥/문/창/바닥 등 경계형성 요소)."""
-    related = []
+    """해당 Space와 RelSpaceBoundary로 연결된 부재 목록 (벽/기둥/문/창/바닥 등 경계형성 요소).
+    GlobalId 기준으로 중복 제거한다: 같은 부재(예: 기둥 하나)가 하나의 Space와 여러 개의
+    별도 경계면(RelSpaceBoundary 레코드)으로 연결되는 경우가 실제로 있음을 확인했다
+    (예: 샘플 파일 Space-S-01에 접한 기둥은 물리적으로 7개인데, RelSpaceBoundary 레코드는
+    23건 - 기둥 하나당 여러 면이 각각 별도 레코드로 잡힘). 개수 집계는 물리적 개체 수
+    기준이어야 하므로 여기서 dedup한다."""
+    by_guid = {}
     for rel in ifc_file.by_type('IfcRelSpaceBoundary'):
         if rel.RelatingSpace == space_entity and rel.RelatedBuildingElement is not None:
-            related.append(rel.RelatedBuildingElement)
-    return related
+            el = rel.RelatedBuildingElement
+            by_guid[el.GlobalId] = el
+    return list(by_guid.values())
 
 
 def get_space_contained_equipment(ifc_file, space_entity, classes=EQUIPMENT_CLASSES):
