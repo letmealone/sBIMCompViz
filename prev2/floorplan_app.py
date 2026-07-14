@@ -103,68 +103,15 @@ def _match_spaces_cached(spaces_a, spaces_b, area_thresh, centroid_thresh, cache
 
 def _clear_all_caches():
     """이 세션의 캐시(IFC 파싱/평면 지오메트리/공간매칭 결과)와 선택 상태를 전부 비운다.
-    session_state 기반이라 다른 사용자의 세션에는 전혀 영향을 주지 않는다.
-    층/공간 선택 관련 키는 전부 'left_'/'right_' 접두사로 통일해뒀기 때문에 이 한 번의
-    접두사 매칭으로 다 같이 지워진다 (새 파일 업로드시 이전 파일 정보가 안 남도록 하는 핵심 장치)."""
+    session_state 기반이라 다른 사용자의 세션에는 전혀 영향을 주지 않는다."""
     for key in list(st.session_state.keys()):
         if key.startswith((_SESSION_CACHE_PREFIX, 'left_', 'right_', '_last_storey_pair', '_file_hash_')):
             del st.session_state[key]
-
-
-_FLOOR_BADGE_EMOJIS = ['🟦', '🟩', '🟧', '🟪', '🟥', '🟫', '🟨', '⬛']
-
-
-def _floor_pair_badges(mapping):
-    """match_storeys()가 반환한 {A층이름: B층이름} 매핑으로 (a_badges, b_badges) 생성.
-    같은 쌍은 항상 같은 색 이모지를 받는다 (공간 자동매핑의 번호배지와 같은 개념,
-    체크박스 목록에는 배경색을 직접 칠할 수 없어 색깔 이모지로 대신한다)."""
-    a_badges, b_badges = {}, {}
-    idx = 0
-    for a_name, b_name in mapping.items():
-        if not b_name:
-            continue
-        emoji = _FLOOR_BADGE_EMOJIS[idx % len(_FLOOR_BADGE_EMOJIS)]
-        a_badges[a_name] = emoji
-        b_badges[b_name] = emoji
-        idx += 1
-    return a_badges, b_badges
-
-
-def _render_floor_checkbox_tree(storeys, session_selected_key, key_prefix, badges=None):
-    """체크박스 목록으로 층 하나를 라디오처럼(하나만) 선택하게 하는 위젯.
-    session_selected_key/key_prefix는 반드시 'left_'/'right_'로 시작해야 새 파일 업로드시
-    _clear_all_caches()의 접두사 매칭으로 자동 초기화된다 (기존 IFC 정보 잔존 방지).
-    반환: 현재 선택된 층 이름."""
-    valid_names = [s['Name'] for s in storeys]
-    current = st.session_state.get(session_selected_key)
-    if current not in valid_names:
-        current = valid_names[0] if valid_names else None
-        st.session_state[session_selected_key] = current
-
-    changed_to = None
-    for s in storeys:
-        name = s['Name']
-        cb_key = f'{key_prefix}_{name}'
-        should_check = (name == current)
-        if st.session_state.get(cb_key) != should_check:
-            st.session_state[cb_key] = should_check
-
-        badge = (badges or {}).get(name, '⬜')
-        elev_text = f"{s['Elevation']:.0f}mm" if s['Elevation'] is not None else '-'
-        checked = st.checkbox(f"{badge} {name}  _(고도 {elev_text})_", key=cb_key)
-        if checked and name != current:
-            changed_to = name
-
-    if changed_to:
-        st.session_state[session_selected_key] = changed_to
-        st.rerun()
-    elif current is not None:
-        # 현재 선택된 항목의 체크를 사용자가 해제하려 한 경우 -> 최소 1개는 선택되어야 하므로
-        # 즉시 되돌린다(라디오 버튼처럼 동작하게 하기 위함)
-        if st.session_state.get(f'{key_prefix}_{current}') is False:
-            st.rerun()
-
-    return current
+    # 층 선택 드롭다운은 위 접두사에 안 걸리므로 별도로 명시해서 초기화
+    # (안 지우면 새 파일 업로드 후에도 이전 파일에서 고른 층 이름이 그대로 남아
+    # "이전 IFC 정보가 남아있는 것처럼 보이는" 문제의 원인이 된다)
+    st.session_state.pop('storey_select_a', None)
+    st.session_state.pop('storey_select_b', None)
 
 
 def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix, pair_labels=None):
@@ -379,24 +326,28 @@ if file_a and file_b:
     data_a = _load_ifc_cached(file_a.getvalue(), file_a.name, file_hash_a)
     data_b = _load_ifc_cached(file_b.getvalue(), file_b.name, file_hash_b)
 
-    # 층 자동매핑(고도 기준) - 트리의 배지 색상용. 계산이 가볍고(LLM 호출 없음) 결정론적이라
-    # 별도 켜기/끄기 없이 항상 계산해서 참고용으로 보여준다.
-    floor_mapping, floor_offset = fc.match_storeys(data_a['storeys'], data_b['storeys'])
-    floor_badges_a, floor_badges_b = _floor_pair_badges(floor_mapping)
+    def _fmt_storey(s):
+        elev = s['Elevation']
+        return f"{s['Name']} (고도 {elev:.0f}mm)" if elev is not None else s['Name']
 
-    with st.sidebar:
-        st.divider()
-        st.header('🏢 층 선택')
-        st.caption(
-            '같은 색 배지가 붙은 층끼리 고도 기준 자동 매핑된 층입니다 '
-            f'(오프셋 {floor_offset:.0f}mm 보정). ⬜는 대응되는 층을 못 찾은 경우입니다.'
+    col_sel1, col_sel2 = st.columns(2)
+    with col_sel1:
+        selected_a_name = st.selectbox(
+            '전문가 IFC 층 선택', [s['Name'] for s in data_a['storeys']],
+            format_func=lambda n: _fmt_storey(next(s for s in data_a['storeys'] if s['Name'] == n)),
+            key='storey_select_a',
         )
-        with st.expander('전문가 IFC', expanded=True):
-            selected_a_name = _render_floor_checkbox_tree(
-                data_a['storeys'], 'left_selected_floor', 'left_floor_cb', badges=floor_badges_a)
-        with st.expander('AI IFC', expanded=True):
-            selected_b_name = _render_floor_checkbox_tree(
-                data_b['storeys'], 'right_selected_floor', 'right_floor_cb', badges=floor_badges_b)
+    with col_sel2:
+        selected_b_name = st.selectbox(
+            'AI IFC 층 선택', [s['Name'] for s in data_b['storeys']],
+            format_func=lambda n: _fmt_storey(next(s for s in data_b['storeys'] if s['Name'] == n)),
+            key='storey_select_b',
+        )
+
+    st.caption(
+        '두 IFC의 층은 각각 독립적으로 선택합니다. 드롭다운에 표시된 고도(mm)를 참고해 '
+        '같은 실제 층을 골라 비교해주세요.'
+    )
 
     # 층 선택이 바뀌면 이전 선택된 공간 정보는 초기화
     _cur_key = (selected_a_name, selected_b_name)
@@ -406,9 +357,6 @@ if file_a and file_b:
         st.session_state.pop('left_space_dropdown', None)
         st.session_state.pop('right_space_dropdown', None)
         st.session_state['_last_storey_pair'] = _cur_key
-
-    st.markdown(f"### 비교 중: 전문가 `{selected_a_name}` ↔ AI `{selected_b_name}`")
-    st.caption('층은 왼쪽 사이드바 "🏢 층 선택"에서 바꿀 수 있습니다.')
 
     plan_a = _build_plan_cached(data_a['storeys'], selected_a_name, f'left_{file_hash_a}')
     plan_b = _build_plan_cached(data_b['storeys'], selected_b_name, f'right_{file_hash_b}')

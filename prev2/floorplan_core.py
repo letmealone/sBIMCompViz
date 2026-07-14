@@ -338,16 +338,15 @@ def get_space_contained_equipment(ifc_file, space_entity, classes=EQUIPMENT_CLAS
 
 
 def _wall_display_category(result):
-    """내/외벽 판정을 표시용 카테고리로 변환 (3분류):
-    - '내벽' -> '내부'
-    - '판정불가'(1차 Pset도 없고 2차 지오메트리 근거도 없음) -> '외부(판정불가)'
-    - 그 외('외벽'=1차 Pset 확정, '외벽(추정)'=2차 지오메트리 확정) -> '외부(판정됨)'
-    즉 외벽을 '실제로 판정된 것'과 '판정할 근거가 없어 외부로 편입된 것'을 구분해서 보여준다."""
+    """내/외벽 판정을 좌/우(전문가·AI) 비교가 대칭이 되도록 '내부'/'외부' 이진으로 단순화.
+    '판정불가'는 근거 데이터가 없을 뿐 외벽일 가능성을 배제할 수 없고, 무엇보다
+    AI 모델처럼 한쪽이 전부 판정불가로 나오는 경우 비교 자체가 안 되므로,
+    사용자 요청에 따라 '외부'로 편입하되 괄호로 표시해 원래 판정불가였음을 남긴다."""
     if result == '내벽':
         return '내부', '내벽'
     if result == '판정불가':
-        return '외부(판정불가)', '외벽(판정불가)'
-    return '외부(판정됨)', result  # '외벽' / '외벽(추정)'
+        return '외부', '외벽(판정불가)'
+    return '외부', result  # '외벽' / '외벽(추정)'
 
 
 def build_space_detail(ifc_file, wall_classification, space_entity):
@@ -440,6 +439,18 @@ def _build_highlight_map(related, equipment, wall_classification):
     for e in equipment:
         hl[e.GlobalId] = 'equipment'
     return hl
+
+    return {
+        'name': space_entity.Name or '(이름없음)',
+        'long_name': space_entity.LongName,
+        'guid': space_entity.GlobalId,
+        'area': round(space_area, 2) if space_area is not None else None,
+        'area_method': space_area_method,
+        'class_counts': dict(class_counts),
+        'wall_class_counts': dict(wall_class_counts),
+        'wall_area_by_class': {k: round(v, 2) for k, v in wall_area_by_class.items()},
+        'area_by_class': area_by_class,
+    }
 
 
 # ===================================================================
