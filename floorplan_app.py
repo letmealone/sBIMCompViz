@@ -134,35 +134,47 @@ def _render_floor_checkbox_tree(storeys, session_selected_key, key_prefix, badge
     """체크박스 목록으로 층 하나를 라디오처럼(하나만) 선택하게 하는 위젯.
     session_selected_key/key_prefix는 반드시 'left_'/'right_'로 시작해야 새 파일 업로드시
     _clear_all_caches()의 접두사 매칭으로 자동 초기화된다 (기존 IFC 정보 잔존 방지).
-    반환: 현재 선택된 층 이름."""
+    반환: 현재 선택된 층 이름.
+
+    주의(버그 수정 이력): 체크박스 생성 '직전에' 매번 강제로 상태를 동기화하면, 사용자가
+    방금 클릭한 값을 코드가 읽기도 전에 덮어써버려 클릭이 무시되는 문제가 있었다.
+    그래서 강제 동기화는 '우리가 직접 st.rerun()을 요청한 바로 다음 실행'에서만
+    (sync_flag_key로 표시) 적용하고, 그 외의 일반 실행에서는 체크박스를 있는 그대로
+    두어 사용자의 클릭이 먼저 반영되도록 한다."""
     valid_names = [s['Name'] for s in storeys]
     current = st.session_state.get(session_selected_key)
     if current not in valid_names:
         current = valid_names[0] if valid_names else None
         st.session_state[session_selected_key] = current
 
-    changed_to = None
+    sync_flag_key = f'{key_prefix}__sync_pending'
+    if st.session_state.pop(sync_flag_key, False):
+        # 직전 실행에서 선택이 바뀌어 우리가 rerun을 요청한 그 다음 실행 -> 지금은
+        # 아직 어떤 체크박스도 이번 실행에서 생성되지 않았으므로 안전하게 강제 동기화 가능
+        for s in storeys:
+            st.session_state[f'{key_prefix}_{s["Name"]}'] = (s['Name'] == current)
+
+    checked_states = {}
     for s in storeys:
         name = s['Name']
         cb_key = f'{key_prefix}_{name}'
-        should_check = (name == current)
-        if st.session_state.get(cb_key) != should_check:
-            st.session_state[cb_key] = should_check
+        if cb_key not in st.session_state:
+            st.session_state[cb_key] = (name == current)  # 최초 생성시 기본값만 설정
 
         badge = (badges or {}).get(name, '⬜')
         elev_text = f"{s['Elevation']:.0f}mm" if s['Elevation'] is not None else '-'
-        checked = st.checkbox(f"{badge} {name}  _(고도 {elev_text})_", key=cb_key)
-        if checked and name != current:
-            changed_to = name
+        checked_states[name] = st.checkbox(f"{badge} {name}  _(고도 {elev_text})_", key=cb_key)
 
-    if changed_to:
-        st.session_state[session_selected_key] = changed_to
+    newly_checked = [n for n, c in checked_states.items() if c and n != current]
+    if newly_checked:
+        st.session_state[session_selected_key] = newly_checked[0]
+        st.session_state[sync_flag_key] = True
         st.rerun()
-    elif current is not None:
+    elif checked_states.get(current) is False:
         # 현재 선택된 항목의 체크를 사용자가 해제하려 한 경우 -> 최소 1개는 선택되어야 하므로
         # 즉시 되돌린다(라디오 버튼처럼 동작하게 하기 위함)
-        if st.session_state.get(f'{key_prefix}_{current}') is False:
-            st.rerun()
+        st.session_state[sync_flag_key] = True
+        st.rerun()
 
     return current
 
