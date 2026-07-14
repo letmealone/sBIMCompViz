@@ -18,6 +18,7 @@ ifcopenshell, numpy, pandas, openpyxl (ifc_to_excel.py 의존성)
 """
 import os
 import tempfile
+import hashlib
 
 import streamlit as st
 
@@ -55,32 +56,57 @@ def _extract_customdata_guid(point):
     return cd
 
 
-@st.cache_resource(show_spinner='IFC 파일 파싱 중... (지붕/천장 면적 등 지오메트리 계산 포함, 수 초~수십 초 소요될 수 있음)')
-def _load_ifc_cached(file_bytes, filename):
-    """업로드된 IFC를 임시파일로 저장 후 파싱. st.cache_resource로 파일당 1회만 실행."""
-    suffix = os.path.splitext(filename)[1] or '.ifc'
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(file_bytes)
-        path = tmp.name
-    return fc.load_ifc(path)
+
+_SESSION_CACHE_PREFIX = '_cache__'
 
 
-@st.cache_resource(show_spinner='해당 층 도면 지오메트리 계산 중...')
-def _build_plan_cached(_storeys, storey_name, cache_tag):
-    """층별 평면 지오메트리 캐싱.
-    _storeys: 언더스코어 접두사라 Streamlit이 해싱을 시도하지 않음
-    (ifcopenshell 엔티티가 섞여있어 해싱 불가/불안정하므로 캐시 키 계산에서 제외).
-    storey_name, cache_tag: 둘 다 일반 문자열이라 해시 가능 -> 실제 캐시 구분에 사용됨.
-    cache_tag로 좌/우 파일을 구분해 서로 다른 파일의 같은 층 이름이 캐시를 덮어쓰지 않게 한다."""
-    storey = next(s for s in _storeys if s['Name'] == storey_name)
-    return fc.build_storey_plan_data(storey)
+def _session_cache(key, compute_fn):
+    """이 세션(session_state)에만 저장되는 캐시. st.cache_resource와 달리 다른 사용자의
+    세션에는 전혀 영향을 주지 않는다 - session_state 자체가 세션별로 격리되어 있기 때문.
+    key가 이미 있으면 재계산 없이 그대로 반환, 없으면 compute_fn()을 실행해 저장 후 반환."""
+    full_key = _SESSION_CACHE_PREFIX + key
+    if full_key not in st.session_state:
+        st.session_state[full_key] = compute_fn()
+    return st.session_state[full_key]
 
 
-@st.cache_resource(show_spinner='공간 자동 매핑 계산 중... (면적으로 좌표계 오프셋 추정 후 centroid 매칭)')
-def _match_spaces_cached(_spaces_a, _spaces_b, area_thresh, centroid_thresh, cache_tag):
-    """_spaces_a/_spaces_b: 언더스코어 접두사라 해싱 제외(폴리곤 객체 포함이라 해시 불가/불안정).
-    area_thresh, centroid_thresh, cache_tag는 해시 가능 -> 임계값/층조합이 바뀌면 캐시도 갱신됨."""
-    return fc.match_spaces(_spaces_a, _spaces_b, area_thresh=area_thresh, centroid_thresh=centroid_thresh)
+def _load_ifc_cached(file_bytes, filename, file_hash):
+    """업로드된 IFC를 임시파일로 저장 후 파싱. 이 세션 안에서 같은 파일(해시로 식별)에 대해
+    1회만 실행되도록 session_state에 저장."""
+    def _compute():
+        suffix = os.path.splitext(filename)[1] or '.ifc'
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(file_bytes)
+            path = tmp.name
+        return fc.load_ifc(path)
+    with st.spinner('IFC 파일 파싱 중... (지붕/천장 면적 등 지오메트리 계산 포함, 수 초~수십 초 소요될 수 있음)'):
+        return _session_cache(f'ifc_{file_hash}', _compute)
+
+
+def _build_plan_cached(storeys, storey_name, cache_tag):
+    """층별 평면 지오메트리를 이 세션 안에서만 캐싱.
+    cache_tag: 파일해시 등을 포함한 문자열로, 같은 층 이름이라도 파일이 다르면 구분되게 한다."""
+    def _compute():
+        storey = next(s for s in storeys if s['Name'] == storey_name)
+        return fc.build_storey_plan_data(storey)
+    with st.spinner('해당 층 도면 지오메트리 계산 중...'):
+        return _session_cache(f'plan_{cache_tag}_{storey_name}', _compute)
+
+
+def _match_spaces_cached(spaces_a, spaces_b, area_thresh, centroid_thresh, cache_tag):
+    """공간 자동 매핑 결과를 이 세션 안에서만 캐싱."""
+    def _compute():
+        return fc.match_spaces(spaces_a, spaces_b, area_thresh=area_thresh, centroid_thresh=centroid_thresh)
+    with st.spinner('공간 자동 매핑 계산 중... (면적으로 좌표계 오프셋 추정 후 centroid 매칭)'):
+        return _session_cache(f'spacematch_{cache_tag}_{area_thresh}_{centroid_thresh}', _compute)
+
+
+def _clear_all_caches():
+    """이 세션의 캐시(IFC 파싱/평면 지오메트리/공간매칭 결과)와 선택 상태를 전부 비운다.
+    session_state 기반이라 다른 사용자의 세션에는 전혀 영향을 주지 않는다."""
+    for key in list(st.session_state.keys()):
+        if key.startswith((_SESSION_CACHE_PREFIX, 'left_', 'right_', '_last_storey_pair', '_file_hash_')):
+            del st.session_state[key]
 
 
 def _render_plot_and_get_detail(label, data, storey_name, plan, session_prefix):
@@ -201,10 +227,22 @@ def _render_comparison_tables(detail_left, detail_right, label_left='전문가',
 
 
 # ===================================================================
-# 사이드바: 공간 자동 매핑 설정
+# 사이드바: 초기화 + 공간 자동 매핑 설정
 # ===================================================================
 
 with st.sidebar:
+    st.header('🔄 초기화')
+    if st.button('내 세션 캐시 초기화 (문제 있을 때)', width='stretch'):
+        _clear_all_caches()
+        st.success('이 세션의 캐시를 초기화했습니다. (다른 사용자에게는 영향 없음)')
+        st.rerun()
+    st.caption(
+        '평면도가 이전에 올린 파일 내용처럼 보이는 등 문제가 있을 때 눌러주세요. '
+        '이 캐시는 세션(브라우저 탭)별로 독립되어 있어 다른 사용자의 화면에는 영향을 주지 않습니다. '
+        '새 IFC를 업로드하면 자동으로도 초기화됩니다.'
+    )
+    st.divider()
+
     st.header('⚙️ 공간 자동 매핑')
     auto_map_enabled = st.checkbox(
         '면적 + centroid 좌표 오차 기준으로 자동 매핑',
@@ -235,8 +273,25 @@ with col_up2:
     file_b = st.file_uploader('AI 생성 IFC 업로드', type=['ifc'], key='upload_b')
 
 if file_a and file_b:
-    data_a = _load_ifc_cached(file_a.getvalue(), file_a.name)
-    data_b = _load_ifc_cached(file_b.getvalue(), file_b.name)
+    # 실제 파일 내용 기반 식별자 (다른 파일이 우연히 같은 층 이름을 가져도 캐시가 섞이지 않도록,
+    # 아래 _build_plan_cached/_match_spaces_cached의 cache_tag에 사용)
+    file_hash_a = hashlib.md5(file_a.getvalue()).hexdigest()[:10]
+    file_hash_b = hashlib.md5(file_b.getvalue()).hexdigest()[:10]
+
+    # 이전 실행에서 기록해둔 파일 해시와 다르면(=새 IFC로 교체됨) 캐시를 자동으로 비운다
+    # (근본 조치: 정합성은 해시 기반 캐시 키로 이미 보장되지만, 이렇게 안 하면 안 쓰는
+    # 이전 파일의 캐시 엔트리가 계속 쌓여 메모리를 차지하게 된다)
+    prev_hash_a = st.session_state.get('_file_hash_a')
+    prev_hash_b = st.session_state.get('_file_hash_b')
+    if (prev_hash_a is not None and prev_hash_a != file_hash_a) or \
+       (prev_hash_b is not None and prev_hash_b != file_hash_b):
+        _clear_all_caches()
+        st.toast('새 IFC 파일이 감지되어 이전 캐시를 자동으로 비웠습니다.', icon='🔄')
+    st.session_state['_file_hash_a'] = file_hash_a
+    st.session_state['_file_hash_b'] = file_hash_b
+
+    data_a = _load_ifc_cached(file_a.getvalue(), file_a.name, file_hash_a)
+    data_b = _load_ifc_cached(file_b.getvalue(), file_b.name, file_hash_b)
 
     def _fmt_storey(s):
         elev = s['Elevation']
@@ -268,14 +323,14 @@ if file_a and file_b:
         st.session_state.pop('right_selected_guid', None)
         st.session_state['_last_storey_pair'] = _cur_key
 
-    plan_a = _build_plan_cached(data_a['storeys'], selected_a_name, 'left')
-    plan_b = _build_plan_cached(data_b['storeys'], selected_b_name, 'right')
+    plan_a = _build_plan_cached(data_a['storeys'], selected_a_name, f'left_{file_hash_a}')
+    plan_b = _build_plan_cached(data_b['storeys'], selected_b_name, f'right_{file_hash_b}')
 
     space_a_to_b, space_b_to_a = {}, {}
     if auto_map_enabled:
         space_a_to_b, space_b_to_a, match_offset, match_info = _match_spaces_cached(
             plan_a['spaces'], plan_b['spaces'], area_thresh, centroid_thresh,
-            f'{selected_a_name}|{selected_b_name}',
+            f'{file_hash_a}_{selected_a_name}|{file_hash_b}_{selected_b_name}',
         )
         if match_offset:
             st.success(
